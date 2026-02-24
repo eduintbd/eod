@@ -40,11 +40,12 @@ export function ImportAuditLog() {
           <tr className="border-b border-border text-left text-muted-foreground bg-muted/50">
             <th className="p-3">File Name</th>
             <th className="p-3">Type</th>
+            <th className="p-3">Data Date</th>
             <th className="p-3 text-right">Total</th>
             <th className="p-3 text-right">Processed</th>
             <th className="p-3 text-right">Rejected</th>
             <th className="p-3">Status</th>
-            <th className="p-3">Date</th>
+            <th className="p-3">Imported At</th>
           </tr>
         </thead>
         <tbody>
@@ -52,6 +53,11 @@ export function ImportAuditLog() {
             <tr key={a.id} className="border-b border-border last:border-0">
               <td className="p-3 font-medium max-w-xs truncate">{a.file_name}</td>
               <td className="p-3 text-xs">{a.file_type}</td>
+              <td className="p-3 text-xs font-medium">
+                {a.data_date
+                  ? new Date(a.data_date + 'T00:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+                  : '-'}
+              </td>
               <td className="p-3 text-right">{a.total_rows.toLocaleString()}</td>
               <td className="p-3 text-right text-success">{a.processed_rows.toLocaleString()}</td>
               <td className="p-3 text-right text-destructive">{a.rejected_rows.toLocaleString()}</td>

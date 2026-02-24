@@ -2,12 +2,14 @@ import { useState, useCallback, type DragEvent } from 'react';
 import { Upload, FileText, AlertCircle, CheckCircle2, Loader2 } from 'lucide-react';
 import { useImport, type FileType } from '@/hooks/useImport';
 import { ImportAuditLog } from '@/components/import/ImportAuditLog';
+import { ImportSummary } from '@/components/import/ImportSummary';
 
 export function ImportPage() {
-  const { progress, importFile, processTrades, reset } = useImport();
+  const { progress, importFile, processTrades, reset, lastAuditId } = useImport();
   const [dragOver, setDragOver] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileType, setFileType] = useState<FileType | ''>('');
+  const [asOfDate, setAsOfDate] = useState(() => new Date().toISOString().slice(0, 10));
 
   const handleDrop = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -38,11 +40,11 @@ export function ImportPage() {
 
   const handleUpload = async () => {
     if (!selectedFile || !fileType) return;
-    await importFile(selectedFile, fileType as FileType);
+    await importFile(selectedFile, fileType as FileType, asOfDate);
   };
 
   const handleProcessTrades = async () => {
-    await processTrades();
+    await processTrades(lastAuditId ?? undefined);
   };
 
   const handleReset = () => {
@@ -117,6 +119,19 @@ export function ImportPage() {
                 </select>
               </div>
 
+              <div>
+                <label className="block text-sm font-medium mb-1">Data Date (As-of Date)</label>
+                <input
+                  type="date"
+                  value={asOfDate}
+                  onChange={e => setAsOfDate(e.target.value)}
+                  className="w-full px-3 py-2 border border-input rounded-md text-sm"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  The date this data represents (e.g. balance date, transaction date)
+                </p>
+              </div>
+
               <div className="flex gap-2">
                 <button
                   onClick={handleUpload}
@@ -152,6 +167,9 @@ export function ImportPage() {
                 <Loader2 size={16} className="animate-spin" />
                 <span className="capitalize">{progress.stage}...</span>
               </div>
+              {progress.message && (
+                <p className="text-xs text-muted-foreground">{progress.message}</p>
+              )}
               {progress.totalRows > 0 && (
                 <>
                   <div className="w-full bg-muted rounded-full h-2">
@@ -210,6 +228,11 @@ export function ImportPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Data Summary */}
+      <div className="mb-8">
+        <ImportSummary />
       </div>
 
       {/* Audit Log */}

@@ -31,6 +31,28 @@ export function formatPct(n: number | null | undefined): string {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
+/** Get CSS classes for margin status badge */
+export function getMarginStatusColor(status: string): string {
+  switch (status) {
+    case 'NORMAL':
+      return 'bg-success/10 text-success';
+    case 'WARNING':
+      return 'bg-warning/10 text-warning';
+    case 'MARGIN_CALL':
+      return 'bg-orange-500/10 text-orange-500';
+    case 'FORCE_SELL':
+      return 'bg-destructive/10 text-destructive';
+    default:
+      return 'bg-muted text-muted-foreground';
+  }
+}
+
+/** Format margin ratio as percentage */
+export function formatMarginPct(ratio: number | null | undefined): string {
+  if (ratio == null) return '—';
+  return `${(ratio * 100).toFixed(1)}%`;
+}
+
 /** Parse a "number" string that may have commas and parens for negatives */
 export function parseFormattedNumber(s: string | null | undefined): number {
   if (!s || s.trim() === '' || s.trim() === '#N/A') return 0;

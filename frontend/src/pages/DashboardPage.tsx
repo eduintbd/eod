@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { formatBDT, formatNumber } from '@/lib/utils';
-import { Users, Briefcase, Wallet, FileText, TrendingUp, ArrowRight } from 'lucide-react';
+import { Users, Briefcase, Wallet, FileText, TrendingUp, ArrowRight, Shield } from 'lucide-react';
 import { useAllLatestPrices } from '@/hooks/useMarketData';
+import { useMarginAccounts } from '@/hooks/useMarginData';
 
 interface DashboardStats {
   totalClients: number;
@@ -25,6 +26,7 @@ export function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
   const { prices: marketPrices, latestDate, loading: marketLoading } = useAllLatestPrices();
+  const { accounts: marginAccounts } = useMarginAccounts('ALL');
 
   useEffect(() => {
     async function load() {
@@ -101,6 +103,49 @@ export function DashboardPage() {
             <p className="text-xl font-semibold">{value}</p>
           </div>
         ))}
+      </div>
+
+      {/* Risk Overview */}
+      <div className="bg-card rounded-lg border border-border mb-8">
+        <div className="p-4 border-b border-border flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Shield size={18} className="text-primary" />
+            <h2 className="font-semibold">Risk Overview</h2>
+          </div>
+          <Link to="/risk" className="text-xs text-primary flex items-center gap-1 hover:underline">
+            View All <ArrowRight size={12} />
+          </Link>
+        </div>
+        {marginAccounts.length === 0 ? (
+          <p className="p-4 text-sm text-muted-foreground">No margin accounts configured yet.</p>
+        ) : (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4">
+            <div className="bg-success/5 rounded-lg p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">Normal</p>
+              <p className="text-2xl font-semibold text-success">
+                {marginAccounts.filter(a => a.maintenance_status === 'NORMAL').length}
+              </p>
+            </div>
+            <div className="bg-warning/5 rounded-lg p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">Warning</p>
+              <p className="text-2xl font-semibold text-warning">
+                {marginAccounts.filter(a => a.maintenance_status === 'WARNING').length}
+              </p>
+            </div>
+            <div className="bg-orange-500/5 rounded-lg p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">Margin Call</p>
+              <p className="text-2xl font-semibold text-orange-500">
+                {marginAccounts.filter(a => a.maintenance_status === 'MARGIN_CALL').length}
+              </p>
+            </div>
+            <div className="bg-destructive/5 rounded-lg p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">Force Sell</p>
+              <p className="text-2xl font-semibold text-destructive">
+                {marginAccounts.filter(a => a.maintenance_status === 'FORCE_SELL').length}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Market Data Summary */}

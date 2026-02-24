@@ -24,7 +24,7 @@ Deno.serve(async (req) => {
       .in('status', ['FILL', 'PF'])
       .gt('quantity', 0)
       .order('id', { ascending: true })
-      .limit(5000);
+      .limit(200);
 
     if (importAuditId) {
       query = query.eq('import_audit_id', importAuditId);
@@ -115,31 +115,56 @@ Deno.serve(async (req) => {
           throw new Error(`Cannot resolve client for bo_id=${raw.bo_id}, client_code=${raw.client_code}`);
         }
 
-        // Step 4: Resolve security
-        let isin = raw.isin;
-        if (!isin && raw.security_code) {
-          const { data: sec } = await supabase
+        // Step 4: Resolve security — prefer existing record to stay
+        // consistent with holdings imported from admin balance
+        let isin: string | null = null;
+
+        // Priority 1: look up by security_code (most reliable match)
+        if (raw.security_code) {
+          const { data: byCode } = await supabase
             .from('securities')
             .select('isin')
             .eq('security_code', raw.security_code)
             .single();
-          isin = sec?.isin ?? null;
+          if (byCode) {
+            isin = byCode.isin;
+          }
         }
 
-        // Create placeholder security if not found
-        if (!isin) {
-          isin = `PLACEHOLDER-${raw.security_code || raw.id}`;
-          await supabase
+        // Priority 2: look up by raw ISIN
+        if (!isin && raw.isin) {
+          const { data: byIsin } = await supabase
             .from('securities')
-            .upsert({
-              isin,
-              security_code: raw.security_code,
-              company_name: raw.security_code,
-              asset_class: raw.asset_class || 'EQ',
-              category: raw.category,
-              board: raw.board,
-              status: 'active',
-            }, { onConflict: 'isin', ignoreDuplicates: true });
+            .select('isin')
+            .eq('isin', raw.isin)
+            .single();
+          if (byIsin) {
+            isin = byIsin.isin;
+          }
+        }
+
+        // Priority 3: create new security if not found at all
+        if (!isin) {
+          isin = raw.isin || `PLACEHOLDER-${raw.security_code || raw.id}`;
+          const code = raw.security_code || isin;
+          const { error: secErr } = await supabase.from('securities').insert({
+            isin,
+            security_code: code,
+            company_name: code,
+            asset_class: raw.asset_class || 'EQ',
+            category: raw.category,
+            board: raw.board,
+            status: 'active',
+          });
+          // If insert fails (duplicate security_code), try lookup again
+          if (secErr) {
+            const { data: retry } = await supabase
+              .from('securities')
+              .select('isin')
+              .eq('security_code', code)
+              .single();
+            isin = retry?.isin ?? isin;
+          }
         }
 
         // Step 5: Compute fees

@@ -125,6 +125,7 @@ export interface ImportAudit {
   file_name: string;
   file_type: 'ADMIN_BALANCE' | 'DSE_TRADE' | 'CSE_TRADE' | 'DEPOSIT_WITHDRAWAL' | 'PRICE_DATA';
   import_date: string;
+  data_date: string | null;
   total_rows: number;
   processed_rows: number;
   rejected_rows: number;
@@ -216,4 +217,61 @@ export interface ParsedDeposit {
   type: string;
   reference: string | null;
   narration: string | null;
+}
+
+// === Margin & Risk types ===
+
+export interface MarginAccount {
+  client_id: string;
+  loan_balance: number;
+  margin_ratio: number;
+  portfolio_value: number;
+  client_equity: number;
+  maintenance_status: 'NORMAL' | 'WARNING' | 'MARGIN_CALL' | 'FORCE_SELL';
+  last_margin_call_date: string | null;
+  margin_call_count: number;
+  created_at: string;
+  updated_at: string;
+  client?: Client;
+}
+
+export interface MarginAlert {
+  id: number;
+  client_id: string;
+  alert_date: string;
+  alert_type: string;
+  details: Record<string, unknown> | null;
+  notification_sent: boolean;
+  resolved: boolean;
+  resolved_date: string | null;
+  resolved_by: string | null;
+  created_at: string;
+  client?: Client;
+}
+
+export interface DailySnapshot {
+  client_id: string;
+  snapshot_date: string;
+  total_portfolio_value: number;
+  cash_balance: number;
+  loan_balance: number;
+  net_equity: number;
+  margin_utilization_pct: number | null;
+  unrealized_pl: number;
+  created_at: string;
+  client?: Client;
+}
+
+export interface FeeScheduleEntry {
+  id: number;
+  fee_type: string;
+  rate: number;
+  min_amount: number | null;
+  max_amount: number | null;
+  applies_to: string | null;
+  effective_from: string;
+  effective_to: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
 }

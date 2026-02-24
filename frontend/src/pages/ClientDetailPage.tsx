@@ -1,9 +1,12 @@
 import { useEffect, useState, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Shield } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
-import { formatBDT, formatNumber, formatPct } from '@/lib/utils';
+import { formatBDT, formatNumber, formatPct, formatMarginPct, getMarginStatusColor } from '@/lib/utils';
 import { useLatestPrices } from '@/hooks/useMarketData';
+import { useMarginAccount } from '@/hooks/useMarginData';
+import { useMarginAlerts } from '@/hooks/useAlerts';
+import { useClientSnapshots } from '@/hooks/useSnapshots';
 import type { Client, Holding, CashLedgerEntry, TradeExecution, Security } from '@/lib/types';
 
 export function ClientDetailPage() {
@@ -13,7 +16,7 @@ export function ClientDetailPage() {
   const [cashEntries, setCashEntries] = useState<CashLedgerEntry[]>([]);
   const [trades, setTrades] = useState<TradeExecution[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'holdings' | 'cash' | 'trades'>('holdings');
+  const [tab, setTab] = useState<'holdings' | 'cash' | 'trades' | 'margin'>('holdings');
 
   useEffect(() => {
     if (!clientId) return;
@@ -60,6 +63,12 @@ export function ClientDetailPage() {
 
   const { prices: livePrices, loading: pricesLoading } = useLatestPrices(symbols);
 
+  // Margin data
+  const { account: marginAccount, loading: marginLoading } = useMarginAccount(clientId);
+  const { alerts: clientAlerts } = useMarginAlerts({ resolved: null, page: 0 });
+  const filteredAlerts = clientAlerts.filter(a => a.client_id === clientId);
+  const { snapshots: clientSnapshots } = useClientSnapshots(clientId, 10);
+
   if (loading) return <div className="text-muted-foreground">Loading...</div>;
   if (!client) return <div className="text-destructive">Client not found</div>;
 
@@ -84,6 +93,7 @@ export function ClientDetailPage() {
     { key: 'holdings' as const, label: `Holdings (${holdings.length})` },
     { key: 'cash' as const, label: 'Cash Ledger' },
     { key: 'trades' as const, label: 'Trade History' },
+    { key: 'margin' as const, label: 'Margin' },
   ];
 
   return (
@@ -314,6 +324,116 @@ export function ClientDetailPage() {
                 })}
               </tbody>
             </table>
+          )
+        )}
+
+        {tab === 'margin' && (
+          marginLoading ? (
+            <p className="p-4 text-sm text-muted-foreground">Loading margin data...</p>
+          ) : !marginAccount ? (
+            <div className="p-8 text-center text-muted-foreground">
+              <Shield size={40} className="mx-auto mb-3 opacity-30" />
+              <p className="text-sm">This client does not have a margin account.</p>
+            </div>
+          ) : (
+            <div className="p-4 space-y-6">
+              {/* Margin Account Status */}
+              <div>
+                <h3 className="text-sm font-semibold mb-3">Margin Account Status</h3>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Loan Balance</p>
+                    <p className="text-lg font-semibold">{formatBDT(marginAccount.loan_balance)}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Portfolio Value</p>
+                    <p className="text-lg font-semibold">{formatBDT(marginAccount.portfolio_value)}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Client Equity</p>
+                    <p className="text-lg font-semibold">{formatBDT(marginAccount.client_equity)}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Margin Ratio</p>
+                    <p className="text-lg font-semibold">{formatMarginPct(marginAccount.margin_ratio)}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Status</p>
+                    <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${getMarginStatusColor(marginAccount.maintenance_status)}`}>
+                      {marginAccount.maintenance_status.replace('_', ' ')}
+                    </span>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Margin Call Count</p>
+                    <p className="text-lg font-semibold">{marginAccount.margin_call_count}</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Alert History */}
+              <div>
+                <h3 className="text-sm font-semibold mb-3">Alert History</h3>
+                {filteredAlerts.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No alerts for this client.</p>
+                ) : (
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="p-2">Date</th>
+                        <th className="p-2">Type</th>
+                        <th className="p-2">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredAlerts.slice(0, 10).map(a => (
+                        <tr key={a.id} className="border-b border-border last:border-0">
+                          <td className="p-2 text-xs">{a.alert_date}</td>
+                          <td className="p-2">
+                            <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${getMarginStatusColor(a.alert_type)}`}>
+                              {a.alert_type.replace('_', ' ')}
+                            </span>
+                          </td>
+                          <td className="p-2 text-xs">{a.resolved ? 'Resolved' : 'Active'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              {/* Snapshot Trend */}
+              <div>
+                <h3 className="text-sm font-semibold mb-3">Snapshot Trend</h3>
+                {clientSnapshots.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No snapshot history available.</p>
+                ) : (
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="p-2">Date</th>
+                        <th className="p-2 text-right">Portfolio</th>
+                        <th className="p-2 text-right">Cash</th>
+                        <th className="p-2 text-right">Loan</th>
+                        <th className="p-2 text-right">Equity</th>
+                        <th className="p-2 text-right">Margin %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {clientSnapshots.map(snap => (
+                        <tr key={snap.snapshot_date} className="border-b border-border last:border-0">
+                          <td className="p-2 text-xs">{snap.snapshot_date}</td>
+                          <td className="p-2 text-right">{formatBDT(snap.total_portfolio_value)}</td>
+                          <td className="p-2 text-right">{formatBDT(snap.cash_balance)}</td>
+                          <td className="p-2 text-right">{formatBDT(snap.loan_balance)}</td>
+                          <td className="p-2 text-right">{formatBDT(snap.net_equity)}</td>
+                          <td className="p-2 text-right">{formatMarginPct((snap.margin_utilization_pct ?? 0) / 100)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
           )
         )}
       </div>

@@ -43,12 +43,13 @@ export function calculateFees(
 export async function loadFeeSchedule(
   supabase: { from: (table: string) => unknown },
 ): Promise<FeeSchedule> {
-  const sb = supabase as { from: (t: string) => { select: (s: string) => { eq: (k: string, v: unknown) => { eq: (k: string, v: unknown) => Promise<{ data: Array<{ fee_type: string; rate: number; min_amount: number }> }> } } } };
+  // deno-lint-ignore no-explicit-any
+  const sb = supabase as any;
   const { data } = await sb
     .from('fee_schedule')
     .select('fee_type, rate, min_amount')
     .eq('is_active', true)
-    .eq('effective_to', null);
+    .is('effective_to', null);
 
   const fees = data || [];
   const get = (type: string) => fees.find(f => f.fee_type === type);

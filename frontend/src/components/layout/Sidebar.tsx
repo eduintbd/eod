@@ -5,6 +5,9 @@ import {
   Users,
   FileText,
   TrendingUp,
+  Shield,
+  Bell,
+  Settings,
   LogOut,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
@@ -15,6 +18,9 @@ const navItems = [
   { to: '/import', icon: Upload, label: 'Import Data' },
   { to: '/clients', icon: Users, label: 'Clients' },
   { to: '/audit', icon: FileText, label: 'Import Audit' },
+  { to: '/risk', icon: Shield, label: 'Risk & Margin' },
+  { to: '/alerts', icon: Bell, label: 'Margin Alerts' },
+  { to: '/settings', icon: Settings, label: 'Settings' },
 ];
 
 export function Sidebar() {

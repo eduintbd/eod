@@ -8,6 +8,10 @@ import { ClientsPage } from '@/pages/ClientsPage';
 import { ClientDetailPage } from '@/pages/ClientDetailPage';
 import { AuditPage } from '@/pages/AuditPage';
 import { MarketDataPage } from '@/pages/MarketDataPage';
+import { RiskDashboardPage } from '@/pages/RiskDashboardPage';
+import { AlertsPage } from '@/pages/AlertsPage';
+import { SettingsPage } from '@/pages/SettingsPage';
+import { EodSnapshotsPage } from '@/pages/EodSnapshotsPage';
 
 function ProtectedRoutes() {
   const { user, loading } = useAuth();
@@ -33,6 +37,10 @@ function ProtectedRoutes() {
         <Route path="clients" element={<ClientsPage />} />
         <Route path="clients/:clientId" element={<ClientDetailPage />} />
         <Route path="audit" element={<AuditPage />} />
+        <Route path="risk" element={<RiskDashboardPage />} />
+        <Route path="risk/snapshots" element={<EodSnapshotsPage />} />
+        <Route path="alerts" element={<AlertsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>
   );
