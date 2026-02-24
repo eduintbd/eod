@@ -235,11 +235,13 @@ Deno.serve(async (req) => {
           newRealizedPl = oldRealizedPl;
         } else {
           // SELL
-          newQty = oldQty - raw.quantity;
+          newQty = Math.max(0, oldQty - raw.quantity); // Prevent negative quantities
           newAvg = oldAvg; // Average cost does NOT change on sells
           newInvested = oldInvested;
-          // realized_pl += (sell_net_proceeds - average_cost * sell_qty)
-          newRealizedPl = oldRealizedPl + (fees.net_value - oldAvg * raw.quantity);
+          // Use trade price as fallback cost basis when no prior holdings exist
+          const costBasis = oldAvg > 0 ? oldAvg : (Number(raw.price) || 0);
+          // realized_pl += (sell_net_proceeds - cost_basis * sell_qty)
+          newRealizedPl = oldRealizedPl + (fees.net_value - costBasis * raw.quantity);
         }
 
         await supabase
