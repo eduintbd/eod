@@ -133,11 +133,13 @@ export function RiskDashboardPage() {
                 <th className="p-3">Client Code</th>
                 <th className="p-3">Name</th>
                 <th className="p-3 text-right">Portfolio Value</th>
+                <th className="p-3 text-right">Marginable PV</th>
                 <th className="p-3 text-right">Loan Balance</th>
                 <th className="p-3 text-right">Equity</th>
                 <th className="p-3 text-right">Margin Ratio</th>
+                <th className="p-3">Ratio</th>
                 <th className="p-3">Status</th>
-                <th className="p-3">Last Call</th>
+                <th className="p-3">Deadline</th>
                 <th className="p-3 text-right">Calls</th>
               </tr>
             </thead>
@@ -150,16 +152,26 @@ export function RiskDashboardPage() {
                     </Link>
                   </td>
                   <td className="p-3">{a.client?.name ?? '—'}</td>
-                  <td className="p-3 text-right">{formatBDT(a.portfolio_value)}</td>
+                  <td className="p-3 text-right">{formatBDT(a.total_portfolio_value ?? a.portfolio_value)}</td>
+                  <td className="p-3 text-right">{a.marginable_portfolio_value != null ? formatBDT(a.marginable_portfolio_value) : '—'}</td>
                   <td className="p-3 text-right">{formatBDT(a.loan_balance)}</td>
                   <td className="p-3 text-right">{formatBDT(a.client_equity)}</td>
                   <td className="p-3 text-right">{formatMarginPct(a.margin_ratio)}</td>
+                  <td className="p-3">
+                    {a.applied_ratio ? (
+                      <span className="text-xs font-mono">{a.applied_ratio}</span>
+                    ) : '—'}
+                  </td>
                   <td className="p-3">
                     <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${getMarginStatusColor(a.maintenance_status)}`}>
                       {a.maintenance_status.replace('_', ' ')}
                     </span>
                   </td>
-                  <td className="p-3 text-xs text-muted-foreground">{a.last_margin_call_date ?? '—'}</td>
+                  <td className="p-3 text-xs text-muted-foreground">
+                    {a.margin_call_deadline ? (
+                      <span className="text-orange-500 font-medium">{a.margin_call_deadline}</span>
+                    ) : '—'}
+                  </td>
                   <td className="p-3 text-right">{a.margin_call_count}</td>
                 </tr>
               ))}

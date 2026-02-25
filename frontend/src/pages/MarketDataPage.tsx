@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { RefreshCw, TrendingUp, Search, Database } from 'lucide-react';
+import { RefreshCw, TrendingUp, Search, Database, ShieldCheck } from 'lucide-react';
 import { useAllLatestPrices, useFundamentals } from '@/hooks/useMarketData';
 import { formatNumber, formatBDT } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
@@ -12,6 +12,8 @@ interface LocalSecurity {
   free_float_market_cap: number | null;
   face_value: number | null;
   last_close_price: number | null;
+  is_marginable: boolean | null;
+  marginability_reason: string | null;
 }
 
 /** Fetch enriched securities data from local DB */
@@ -24,7 +26,7 @@ function useLocalSecurities() {
     try {
       const { data } = await supabase
         .from('securities')
-        .select('security_code, sector, category, trailing_pe, free_float_market_cap, face_value, last_close_price');
+        .select('security_code, sector, category, trailing_pe, free_float_market_cap, face_value, last_close_price, is_marginable, marginability_reason');
       const byCode: Record<string, LocalSecurity> = {};
       for (const row of (data ?? []) as LocalSecurity[]) {
         if (row.security_code) byCode[row.security_code] = row;
@@ -51,6 +53,8 @@ export function MarketDataPage() {
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [enriching, setEnriching] = useState(false);
   const [enrichResult, setEnrichResult] = useState<string | null>(null);
+  const [classifying, setClassifying] = useState(false);
+  const [classifyResult, setClassifyResult] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     if (!search) return prices;
@@ -102,6 +106,23 @@ export function MarketDataPage() {
     }
   }
 
+  async function handleClassify() {
+    setClassifying(true);
+    setClassifyResult(null);
+    try {
+      const { data, error } = await supabase.functions.invoke('classify-marginability');
+      if (error) throw error;
+      setClassifyResult(
+        `Classification complete: ${data.marginable_count} marginable, ${data.non_marginable_count} non-marginable (of ${data.total_securities} total)`
+      );
+      refreshSecurities();
+    } catch (err) {
+      setClassifyResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setClassifying(false);
+    }
+  }
+
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
@@ -114,6 +135,14 @@ export function MarketDataPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleClassify}
+            disabled={classifying}
+            className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-md text-sm hover:bg-emerald-700 disabled:opacity-50"
+          >
+            <ShieldCheck size={14} className={classifying ? 'animate-pulse' : ''} />
+            {classifying ? 'Classifying...' : 'Classify Margin'}
+          </button>
           <button
             onClick={handleEnrich}
             disabled={enriching}
@@ -157,6 +186,14 @@ export function MarketDataPage() {
         </div>
       )}
 
+      {classifyResult && (
+        <div className={`mb-4 p-3 rounded text-sm ${
+          classifyResult.startsWith('Error') ? 'bg-destructive/10 text-destructive' : 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+        }`}>
+          {classifyResult}
+        </div>
+      )}
+
       {error && (
         <div className="mb-4 p-3 rounded bg-destructive/10 text-destructive text-sm">
           Failed to load market data: {error}
@@ -191,6 +228,7 @@ export function MarketDataPage() {
                 <th className="p-3 text-right">P/E</th>
                 <th className="p-3 text-right">NAV</th>
                 <th className="p-3 text-right">Mkt Cap (Cr)</th>
+                <th className="p-3">Margin</th>
                 <th className="p-3 text-right">52W High</th>
                 <th className="p-3 text-right">52W Low</th>
               </tr>
@@ -225,6 +263,20 @@ export function MarketDataPage() {
                         : f?.market_cap != null
                           ? formatBDT(f.market_cap)
                           : '—'}
+                    </td>
+                    <td className="p-3">
+                      {sec?.is_marginable != null && (
+                        <span
+                          className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium cursor-help ${
+                            sec.is_marginable
+                              ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                              : 'bg-muted text-muted-foreground'
+                          }`}
+                          title={sec.marginability_reason ?? ''}
+                        >
+                          {sec.is_marginable ? 'Eligible' : 'Ineligible'}
+                        </span>
+                      )}
                     </td>
                     <td className="p-3 text-right">{f?.year_high != null ? formatNumber(f.year_high) : '—'}</td>
                     <td className="p-3 text-right">{f?.year_low != null ? formatNumber(f.year_low) : '—'}</td>

@@ -346,8 +346,16 @@ export function ClientDetailPage() {
                     <p className="text-lg font-semibold">{formatBDT(marginAccount.loan_balance)}</p>
                   </div>
                   <div className="bg-muted/30 rounded-lg p-3">
-                    <p className="text-xs text-muted-foreground mb-1">Portfolio Value</p>
-                    <p className="text-lg font-semibold">{formatBDT(marginAccount.portfolio_value)}</p>
+                    <p className="text-xs text-muted-foreground mb-1">Total Portfolio Value</p>
+                    <p className="text-lg font-semibold">{formatBDT(marginAccount.total_portfolio_value ?? marginAccount.portfolio_value)}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Marginable Portfolio</p>
+                    <p className="text-lg font-semibold">
+                      {marginAccount.marginable_portfolio_value != null
+                        ? formatBDT(marginAccount.marginable_portfolio_value)
+                        : '—'}
+                    </p>
                   </div>
                   <div className="bg-muted/30 rounded-lg p-3">
                     <p className="text-xs text-muted-foreground mb-1">Client Equity</p>
@@ -358,10 +366,20 @@ export function ClientDetailPage() {
                     <p className="text-lg font-semibold">{formatMarginPct(marginAccount.margin_ratio)}</p>
                   </div>
                   <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Applied Ratio</p>
+                    <p className="text-lg font-semibold font-mono">{marginAccount.applied_ratio ?? '—'}</p>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
                     <p className="text-xs text-muted-foreground mb-1">Status</p>
                     <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${getMarginStatusColor(marginAccount.maintenance_status)}`}>
                       {marginAccount.maintenance_status.replace('_', ' ')}
                     </span>
+                  </div>
+                  <div className="bg-muted/30 rounded-lg p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Margin Call Deadline</p>
+                    <p className={`text-lg font-semibold ${marginAccount.margin_call_deadline ? 'text-orange-500' : ''}`}>
+                      {marginAccount.margin_call_deadline ?? '—'}
+                    </p>
                   </div>
                   <div className="bg-muted/30 rounded-lg p-3">
                     <p className="text-xs text-muted-foreground mb-1">Margin Call Count</p>

@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import { Settings, Plus, Pencil, X, Check } from 'lucide-react';
 import { useFeeSchedule, useUpdateFee } from '@/hooks/useFeeSchedule';
+import { useMarginConfig, useUpdateMarginConfig } from '@/hooks/useMarginConfig';
 import { formatNumber } from '@/lib/utils';
 import type { FeeScheduleEntry } from '@/lib/types';
 
-const SETTINGS_TABS = ['fees', 'system'] as const;
+const SETTINGS_TABS = ['fees', 'margin', 'system'] as const;
 
 interface EditingFee {
   id: number | null; // null = new entry
@@ -33,10 +34,15 @@ function emptyFee(): EditingFee {
 }
 
 export function SettingsPage() {
-  const [tab, setTab] = useState<'fees' | 'system'>('fees');
+  const [tab, setTab] = useState<'fees' | 'margin' | 'system'>('fees');
   const { fees, loading, error, refresh } = useFeeSchedule();
   const { updateFee, addFee, saving } = useUpdateFee();
   const [editing, setEditing] = useState<EditingFee | null>(null);
+
+  // Margin config state
+  const { configs: marginConfigs, loading: marginLoading, error: marginError, refresh: marginRefresh } = useMarginConfig();
+  const { updateConfig, saving: marginSaving } = useUpdateMarginConfig();
+  const [editingConfig, setEditingConfig] = useState<{ id: number; value: string } | null>(null);
 
   function startEdit(fee: FeeScheduleEntry) {
     setEditing({
@@ -97,7 +103,7 @@ export function SettingsPage() {
                 : 'border-transparent text-muted-foreground hover:text-foreground'
             }`}
           >
-            {t === 'fees' ? 'Fee Schedule' : 'System'}
+            {t === 'fees' ? 'Fee Schedule' : t === 'margin' ? 'Margin Config' : 'System'}
           </button>
         ))}
       </div>
@@ -256,6 +262,97 @@ export function SettingsPage() {
                           >
                             <Pencil size={14} />
                           </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === 'margin' && (
+        <div>
+          <p className="text-sm text-muted-foreground mb-3">
+            BSEC Margin Rules 2025 parameters. Changes take effect on the next margin calculation run.
+          </p>
+          <div className="bg-card rounded-lg border border-border overflow-hidden">
+            {marginError && <p className="p-4 text-sm text-destructive">Error: {marginError}</p>}
+            {marginLoading ? (
+              <p className="p-4 text-sm text-muted-foreground">Loading margin config...</p>
+            ) : marginConfigs.length === 0 ? (
+              <div className="p-8 text-center text-muted-foreground">
+                <Settings size={40} className="mx-auto mb-3 opacity-30" />
+                <p className="text-sm">No margin config parameters found. Run migration 00004 first.</p>
+              </div>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border text-left text-muted-foreground bg-muted/50">
+                    <th className="p-3">Parameter</th>
+                    <th className="p-3">Description</th>
+                    <th className="p-3 text-right">Value</th>
+                    <th className="p-3">Active</th>
+                    <th className="p-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {marginConfigs.map(cfg => {
+                    const isEditing = editingConfig?.id === cfg.id;
+                    return (
+                      <tr key={cfg.id} className="border-b border-border last:border-0 hover:bg-muted/30">
+                        <td className="p-3 font-medium font-mono text-xs">{cfg.parameter_name}</td>
+                        <td className="p-3 text-xs text-muted-foreground">{cfg.description ?? '—'}</td>
+                        <td className="p-3 text-right">
+                          {isEditing ? (
+                            <input
+                              value={editingConfig.value}
+                              onChange={e => setEditingConfig({ ...editingConfig, value: e.target.value })}
+                              className="w-28 px-2 py-1 text-sm border border-border rounded bg-background text-right"
+                              autoFocus
+                            />
+                          ) : (
+                            <span className="font-mono">{formatNumber(cfg.parameter_value, 4)}</span>
+                          )}
+                        </td>
+                        <td className="p-3">
+                          <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${
+                            cfg.is_active ? 'bg-success/10 text-success' : 'bg-muted text-muted-foreground'
+                          }`}>
+                            {cfg.is_active ? 'Yes' : 'No'}
+                          </span>
+                        </td>
+                        <td className="p-3 text-right">
+                          {isEditing ? (
+                            <div className="flex gap-1 justify-end">
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    await updateConfig(cfg.id, { parameter_value: parseFloat(editingConfig.value) || 0 });
+                                    setEditingConfig(null);
+                                    marginRefresh();
+                                  } catch { /* error shown by hook */ }
+                                }}
+                                disabled={marginSaving}
+                                className="p-1 rounded text-success hover:bg-success/10 disabled:opacity-50"
+                              >
+                                <Check size={16} />
+                              </button>
+                              <button onClick={() => setEditingConfig(null)} className="p-1 rounded text-destructive hover:bg-destructive/10">
+                                <X size={16} />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setEditingConfig({ id: cfg.id, value: String(cfg.parameter_value) })}
+                              disabled={editingConfig !== null}
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-30"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );

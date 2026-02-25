@@ -34,6 +34,9 @@ export interface Security {
   sector: string | null;
   last_close_price: number | null;
   is_marginable: boolean;
+  annual_dividend_pct: number | null;
+  marginability_reason: string | null;
+  marginability_updated_at: string | null;
   status: 'active' | 'suspended';
 }
 
@@ -226,10 +229,14 @@ export interface MarginAccount {
   loan_balance: number;
   margin_ratio: number;
   portfolio_value: number;
+  marginable_portfolio_value: number | null;
+  total_portfolio_value: number | null;
   client_equity: number;
   maintenance_status: 'NORMAL' | 'WARNING' | 'MARGIN_CALL' | 'FORCE_SELL';
   last_margin_call_date: string | null;
   margin_call_count: number;
+  margin_call_deadline: string | null;
+  applied_ratio: string | null;
   created_at: string;
   updated_at: string;
   client?: Client;
@@ -240,6 +247,7 @@ export interface MarginAlert {
   client_id: string;
   alert_date: string;
   alert_type: string;
+  deadline_date: string | null;
   details: Record<string, unknown> | null;
   notification_sent: boolean;
   resolved: boolean;
@@ -260,6 +268,18 @@ export interface DailySnapshot {
   unrealized_pl: number;
   created_at: string;
   client?: Client;
+}
+
+export interface MarginConfigEntry {
+  id: number;
+  parameter_name: string;
+  parameter_value: number;
+  description: string | null;
+  is_active: boolean;
+  effective_from: string;
+  effective_to: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface FeeScheduleEntry {

@@ -27,7 +27,7 @@ export function computeSettlementDate(
   return addBusinessDays(date, 2);
 }
 
-function addBusinessDays(start: Date, days: number): string {
+export function addBusinessDays(start: Date, days: number): string {
   const result = new Date(start);
   let added = 0;
 
