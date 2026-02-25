@@ -41,7 +41,14 @@ export function getMarginStatusColor(status: string): string {
     case 'MARGIN_CALL':
       return 'bg-orange-500/10 text-orange-500';
     case 'FORCE_SELL':
+    case 'FORCE_SELL_TRIGGERED':
       return 'bg-destructive/10 text-destructive';
+    case 'DEADLINE_BREACH':
+      return 'bg-red-700/10 text-red-700';
+    case 'EXPOSURE_BREACH':
+      return 'bg-purple-500/10 text-purple-500';
+    case 'CONCENTRATION_BREACH':
+      return 'bg-amber-600/10 text-amber-600';
     default:
       return 'bg-muted text-muted-foreground';
   }

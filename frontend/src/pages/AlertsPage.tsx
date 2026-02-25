@@ -71,8 +71,10 @@ export function AlertsPage() {
         >
           <option value="">All Types</option>
           <option value="MARGIN_CALL">Margin Call</option>
-          <option value="FORCE_SELL">Force Sell</option>
-          <option value="WARNING">Warning</option>
+          <option value="FORCE_SELL_TRIGGERED">Force Sell</option>
+          <option value="DEADLINE_BREACH">Deadline Breach</option>
+          <option value="EXPOSURE_BREACH">Exposure Breach</option>
+          <option value="CONCENTRATION_BREACH">Concentration Breach</option>
         </select>
       </div>
 

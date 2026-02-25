@@ -246,7 +246,7 @@ export interface MarginAlert {
   id: number;
   client_id: string;
   alert_date: string;
-  alert_type: string;
+  alert_type: 'MARGIN_CALL' | 'FORCE_SELL_TRIGGERED' | 'CONCENTRATION_BREACH' | 'CATEGORY_CHANGE' | 'DEADLINE_BREACH' | 'EXPOSURE_BREACH';
   deadline_date: string | null;
   details: Record<string, unknown> | null;
   notification_sent: boolean;

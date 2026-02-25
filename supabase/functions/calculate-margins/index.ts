@@ -172,17 +172,30 @@ Deno.serve(async (req) => {
 
         // Step 4h: Determine status using configurable thresholds
         const status = determineMarginStatus(equityRatio, config.normal_threshold, config.force_sell_threshold);
-        statusCounts[status]++;
 
         // Step 5: Fetch existing margin_account to detect status changes
         const { data: existingMargin } = await supabase
           .from('margin_accounts')
-          .select('maintenance_status, margin_call_count')
+          .select('maintenance_status, margin_call_count, margin_call_deadline')
           .eq('client_id', client.client_id)
           .single();
 
         const prevStatus = (existingMargin?.maintenance_status as MarginStatus | null) ?? null;
         const prevCallCount = existingMargin?.margin_call_count ?? 0;
+
+        // F1: Deadline enforcement — auto-escalate MARGIN_CALL to FORCE_SELL
+        // when the 3-business-day deadline has passed
+        let effectiveStatus = status;
+        let deadlineBreached = false;
+        if (
+          status === 'MARGIN_CALL' &&
+          existingMargin?.margin_call_deadline &&
+          existingMargin.margin_call_deadline < snapshotDate
+        ) {
+          effectiveStatus = 'FORCE_SELL';
+          deadlineBreached = true;
+        }
+        statusCounts[effectiveStatus]++;
 
         // Build upsert payload with new BSEC fields
         const marginUpsert: Record<string, unknown> = {
@@ -193,18 +206,18 @@ Deno.serve(async (req) => {
           marginable_portfolio_value: round(marginablePortfolioValue),
           total_portfolio_value: round(totalPortfolioValue),
           client_equity: round(totalEquity),
-          maintenance_status: status,
+          maintenance_status: effectiveStatus,
           applied_ratio: appliedRatio,
         };
 
         // Status transition logic
-        if (status === 'MARGIN_CALL' || status === 'FORCE_SELL') {
-          if (prevStatus !== status) {
+        if (effectiveStatus === 'MARGIN_CALL' || effectiveStatus === 'FORCE_SELL') {
+          if (prevStatus !== effectiveStatus) {
             marginUpsert.last_margin_call_date = snapshotDate;
             marginUpsert.margin_call_count = prevCallCount + 1;
 
             // Set 3-business-day deadline on MARGIN_CALL (Section 9(3))
-            if (status === 'MARGIN_CALL') {
+            if (effectiveStatus === 'MARGIN_CALL') {
               marginUpsert.margin_call_deadline = addBusinessDays(
                 new Date(snapshotDate + 'T00:00:00'),
                 config.margin_call_deadline_days,
@@ -214,7 +227,7 @@ Deno.serve(async (req) => {
               marginUpsert.margin_call_deadline = null;
             }
           }
-        } else if (status === 'NORMAL') {
+        } else if (effectiveStatus === 'NORMAL') {
           marginUpsert.margin_call_count = 0;
           marginUpsert.margin_call_deadline = null;
         }
@@ -223,10 +236,10 @@ Deno.serve(async (req) => {
           .from('margin_accounts')
           .upsert(marginUpsert, { onConflict: 'client_id' });
 
-        // Step 6: Generate alert only on status change
-        if (prevStatus !== status && (status === 'MARGIN_CALL' || status === 'FORCE_SELL')) {
-          const alertType = status === 'FORCE_SELL' ? 'FORCE_SELL_TRIGGERED' : 'MARGIN_CALL';
-          const deadlineDate = status === 'MARGIN_CALL'
+        // Step 6: Generate alert on status change
+        if (prevStatus !== effectiveStatus && (effectiveStatus === 'MARGIN_CALL' || effectiveStatus === 'FORCE_SELL')) {
+          const alertType = effectiveStatus === 'FORCE_SELL' ? 'FORCE_SELL_TRIGGERED' : 'MARGIN_CALL';
+          const deadlineDate = effectiveStatus === 'MARGIN_CALL'
             ? addBusinessDays(new Date(snapshotDate + 'T00:00:00'), config.margin_call_deadline_days)
             : null;
 
@@ -252,6 +265,71 @@ Deno.serve(async (req) => {
           if (!alertErr) alertsGenerated++;
         }
 
+        // F1: Generate DEADLINE_BREACH alert (de-duplicated per client per day)
+        if (deadlineBreached) {
+          const { data: existingDeadlineAlert } = await supabase
+            .from('margin_alerts')
+            .select('id')
+            .eq('client_id', client.client_id)
+            .eq('alert_date', snapshotDate)
+            .eq('alert_type', 'DEADLINE_BREACH')
+            .limit(1)
+            .maybeSingle();
+
+          if (!existingDeadlineAlert) {
+            const { error: dbErr } = await supabase
+              .from('margin_alerts')
+              .insert({
+                client_id: client.client_id,
+                alert_date: snapshotDate,
+                alert_type: 'DEADLINE_BREACH',
+                details: {
+                  original_deadline: existingMargin.margin_call_deadline,
+                  equity_ratio: round4(equityRatio),
+                  loan_balance: round(loanBalance),
+                  escalated_to: 'FORCE_SELL',
+                },
+              });
+            if (!dbErr) alertsGenerated++;
+          }
+        }
+
+        // F3: Single client exposure limit (Section 17)
+        if (loanBalance > 0 && config.core_capital_net_worth > 0) {
+          const clientLimit = Math.min(
+            config.core_capital_net_worth * config.single_client_limit_pct,
+            config.single_client_limit_max,
+          );
+          if (loanBalance > clientLimit) {
+            const { data: existingExposureAlert } = await supabase
+              .from('margin_alerts')
+              .select('id')
+              .eq('client_id', client.client_id)
+              .eq('alert_date', snapshotDate)
+              .eq('alert_type', 'EXPOSURE_BREACH')
+              .limit(1)
+              .maybeSingle();
+
+            if (!existingExposureAlert) {
+              const { error: expErr } = await supabase
+                .from('margin_alerts')
+                .insert({
+                  client_id: client.client_id,
+                  alert_date: snapshotDate,
+                  alert_type: 'EXPOSURE_BREACH',
+                  details: {
+                    breach_type: 'SINGLE_CLIENT',
+                    loan_balance: round(loanBalance),
+                    client_limit: round(clientLimit),
+                    core_capital: round(config.core_capital_net_worth),
+                    limit_pct: config.single_client_limit_pct,
+                  },
+                });
+              if (!expErr) alertsGenerated++;
+            }
+          }
+        }
+
         // Step 7: Upsert daily_snapshot
         const unrealizedPl = totalPortfolioValue - totalCostBasis;
         const marginUtilPct = totalPortfolioValue > 0 ? loanBalance / totalPortfolioValue : 0;
@@ -274,6 +352,115 @@ Deno.serve(async (req) => {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         errors.push({ client_id: client.client_id, error: msg });
+      }
+    }
+
+    // F4: Single security concentration limit (Section 18)
+    // Run only on the final batch of a full run (not single-client mode)
+    if (clients.length < BATCH_SIZE && !singleClientId) {
+      try {
+        // Get all margin accounts with outstanding loans
+        const { data: allMarginAccounts } = await supabase
+          .from('margin_accounts')
+          .select('client_id, loan_balance, marginable_portfolio_value')
+          .gt('loan_balance', 0);
+
+        if (allMarginAccounts && allMarginAccounts.length > 0) {
+          const totalOutstandingMargin = allMarginAccounts.reduce(
+            (sum: number, m: Record<string, unknown>) => sum + Number(m.loan_balance),
+            0,
+          );
+
+          if (totalOutstandingMargin > 0) {
+            const marginClientIds = allMarginAccounts.map(
+              (m: Record<string, unknown>) => m.client_id as string,
+            );
+
+            // Get all holdings for margin clients
+            const { data: allHoldings } = await supabase
+              .from('holdings')
+              .select('client_id, isin, quantity, average_cost')
+              .in('client_id', marginClientIds)
+              .gt('quantity', 0);
+
+            if (allHoldings && allHoldings.length > 0) {
+              // Build client portfolio values and per-ISIN holding values
+              const clientPortfolioMap: Record<string, number> = {};
+              const isinLoanAttribution: Record<string, number> = {};
+
+              for (const h of allHoldings) {
+                const cId = h.client_id as string;
+                const holdingValue = Number(h.quantity) * Number(h.average_cost);
+                clientPortfolioMap[cId] = (clientPortfolioMap[cId] ?? 0) + holdingValue;
+              }
+
+              // Attribute each client's loan proportionally across their ISINs
+              for (const h of allHoldings) {
+                const cId = h.client_id as string;
+                const holdingValue = Number(h.quantity) * Number(h.average_cost);
+                const clientPortfolio = clientPortfolioMap[cId] ?? 0;
+                if (clientPortfolio <= 0) continue;
+
+                const marginAcct = allMarginAccounts.find(
+                  (m: Record<string, unknown>) => m.client_id === cId,
+                );
+                const clientLoan = Number(marginAcct?.loan_balance ?? 0);
+                const attribution = (holdingValue / clientPortfolio) * clientLoan;
+
+                const isinKey = h.isin as string;
+                isinLoanAttribution[isinKey] = (isinLoanAttribution[isinKey] ?? 0) + attribution;
+              }
+
+              // Check each ISIN against the concentration limit
+              const concentrationLimit = config.single_security_limit_pct * totalOutstandingMargin;
+
+              for (const [isin, attributedLoan] of Object.entries(isinLoanAttribution)) {
+                if (attributedLoan > concentrationLimit) {
+                  // Find all clients holding this ISIN and generate alerts
+                  const affectedClients = allHoldings
+                    .filter((h: Record<string, unknown>) => h.isin === isin)
+                    .map((h: Record<string, unknown>) => h.client_id as string);
+
+                  const uniqueClients = [...new Set(affectedClients)];
+
+                  for (const affectedClientId of uniqueClients) {
+                    // De-duplicate per client + date + alert_type
+                    const { data: existing } = await supabase
+                      .from('margin_alerts')
+                      .select('id')
+                      .eq('client_id', affectedClientId)
+                      .eq('alert_date', snapshotDate)
+                      .eq('alert_type', 'CONCENTRATION_BREACH')
+                      .limit(1)
+                      .maybeSingle();
+
+                    if (!existing) {
+                      const { error: concErr } = await supabase
+                        .from('margin_alerts')
+                        .insert({
+                          client_id: affectedClientId,
+                          alert_date: snapshotDate,
+                          alert_type: 'CONCENTRATION_BREACH',
+                          details: {
+                            isin,
+                            attributed_loan: round(attributedLoan),
+                            concentration_limit: round(concentrationLimit),
+                            total_outstanding_margin: round(totalOutstandingMargin),
+                            limit_pct: config.single_security_limit_pct,
+                          },
+                        });
+                      if (!concErr) alertsGenerated++;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (concError) {
+        // Concentration check failure should not fail the batch
+        const msg = concError instanceof Error ? concError.message : String(concError);
+        errors.push({ client_id: 'CONCENTRATION_CHECK', error: msg });
       }
     }
 
