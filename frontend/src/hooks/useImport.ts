@@ -73,7 +73,7 @@ export async function validateDailyImportDate(
     .select('id')
     .eq('file_type', mappedType)
     .eq('data_date', dateStr)
-    .eq('status', 'SUCCESS')
+    .in('status', ['SUCCESS', 'PARTIAL'])
     .limit(1);
 
   if (existing && existing.length > 0) {
@@ -297,6 +297,23 @@ export function useImport() {
       errors.push(`${skippedDuplicates} duplicate trades skipped (exec_id already exists)`);
     }
 
+    // ── Compute exchange-wise trade summary stats ──
+    const fills = trades.filter(t => t.status === 'FILL' || t.status === 'PF');
+    const sumValue = (arr: typeof fills) => arr.reduce((s, t) => s + (Number(t.value) || 0), 0);
+    const summary = {
+      dse_buy_count: fills.filter(t => t.source === 'DSE' && t.side === 'B').length,
+      dse_buy_value: sumValue(fills.filter(t => t.source === 'DSE' && t.side === 'B')),
+      dse_sell_count: fills.filter(t => t.source === 'DSE' && t.side === 'S').length,
+      dse_sell_value: sumValue(fills.filter(t => t.source === 'DSE' && t.side === 'S')),
+      cse_buy_count: fills.filter(t => t.source === 'CSE' && t.side === 'B').length,
+      cse_buy_value: sumValue(fills.filter(t => t.source === 'CSE' && t.side === 'B')),
+      cse_sell_count: fills.filter(t => t.source === 'CSE' && t.side === 'S').length,
+      cse_sell_value: sumValue(fills.filter(t => t.source === 'CSE' && t.side === 'S')),
+      total_turnover: 0,
+    };
+    summary.total_turnover = summary.dse_buy_value + summary.dse_sell_value
+      + summary.cse_buy_value + summary.cse_sell_value;
+
     // Update audit record
     const status = errors.length > 0
       ? (inserted > 0 ? 'PARTIAL' : 'FAILED')
@@ -309,7 +326,7 @@ export function useImport() {
         processed_rows: inserted,
         rejected_rows: trades.length - inserted,
         status,
-        error_details: errors.length > 0 ? { errors } : null,
+        error_details: { summary, ...(errors.length > 0 ? { errors } : {}) },
       })
       .eq('id', auditId);
 
@@ -734,7 +751,7 @@ export function useImport() {
       .select('id')
       .eq('file_type', 'DEPOSIT_WITHDRAWAL')
       .eq('data_date', dateStr)
-      .eq('status', 'SUCCESS');
+      .in('status', ['SUCCESS', 'PARTIAL']);
 
     const oldAuditIds = (existingAudits ?? []).map(a => a.id).filter(id => id !== auditId);
     let replacedClients = new Set<string>();
@@ -901,6 +918,18 @@ export function useImport() {
     // ── Step 6: Update last_processed_date ──
     await updateLastProcessedDate(dateStr);
 
+    // ── Compute deposit/withdrawal summary stats ──
+    const depositRows = cashRows.filter(r => r.type === 'DEPOSIT');
+    const withdrawalRows = cashRows.filter(r => r.type === 'WITHDRAWAL');
+    const summary = {
+      deposit_count: depositRows.length,
+      deposit_total: depositRows.reduce((s, r) => s + (r.amount as number), 0),
+      withdrawal_count: withdrawalRows.length,
+      withdrawal_total: withdrawalRows.reduce((s, r) => s + Math.abs(r.amount as number), 0),
+      net_deposit: 0,
+    };
+    summary.net_deposit = summary.deposit_total - summary.withdrawal_total;
+
     // ── Final: Update audit record ──
     const status = errors.length > 0
       ? (processedCount > 0 ? 'PARTIAL' : 'FAILED')
@@ -913,7 +942,7 @@ export function useImport() {
         processed_rows: processedCount,
         rejected_rows: deposits.length - processedCount,
         status,
-        error_details: errors.length > 0 ? { errors: errors.slice(0, 50) } : null,
+        error_details: { summary, ...(errors.length > 0 ? { errors: errors.slice(0, 50) } : {}) },
       })
       .eq('id', auditId);
 
@@ -990,6 +1019,83 @@ export function useImport() {
         processedRows: totalProcessed,
         rejectedRows: totalFailed,
       }));
+    }
+
+    // ── Post-processing: compute commission summary and update trade audit ──
+    if (totalProcessed > 0 && importAuditId) {
+      try {
+        // Get data_date from the audit record
+        const { data: auditRec } = await supabase
+          .from('import_audit')
+          .select('data_date')
+          .eq('id', importAuditId)
+          .single();
+
+        const dateStr = auditRec?.data_date;
+        if (dateStr) {
+          const { data: commRows } = await supabase
+            .from('trade_executions')
+            .select('exchange, side, value, commission, exchange_fee, cdbl_fee, ait')
+            .eq('trade_date', dateStr);
+
+          if (commRows && commRows.length > 0) {
+            let totalValue = 0, totalCommission = 0, totalFees = 0;
+            const byExchangeSide: Record<string, { count: number; value: number; commission: number; fees: number }> = {};
+
+            for (const r of commRows) {
+              const key = `${r.exchange}_${r.side}`;
+              if (!byExchangeSide[key]) byExchangeSide[key] = { count: 0, value: 0, commission: 0, fees: 0 };
+              const v = Number(r.value) || 0;
+              const c = Number(r.commission) || 0;
+              const ef = Number(r.exchange_fee) || 0;
+              const cf = Number(r.cdbl_fee) || 0;
+              const a = Number(r.ait) || 0;
+              byExchangeSide[key].count++;
+              byExchangeSide[key].value += v;
+              byExchangeSide[key].commission += c;
+              byExchangeSide[key].fees += ef + cf + a;
+              totalValue += v;
+              totalCommission += c;
+              totalFees += ef + cf + a;
+            }
+
+            const commissionPct = totalValue > 0 ? (totalCommission / totalValue) * 100 : 0;
+
+            const processingSummary = {
+              total_executions: commRows.length,
+              total_value: totalValue,
+              total_commission: totalCommission,
+              total_fees: totalFees,
+              commission_pct: Math.round(commissionPct * 10000) / 10000,
+              max_allowed_pct: 2,
+              by_exchange_side: byExchangeSide,
+            };
+
+            // Find the trade-type audit for this date and merge processing_summary
+            const { data: tradeAudit } = await supabase
+              .from('import_audit')
+              .select('id, error_details')
+              .in('file_type', ['DSE_TRADE', 'CSE_TRADE'])
+              .eq('data_date', dateStr)
+              .in('status', ['SUCCESS', 'PARTIAL'])
+              .order('id', { ascending: false })
+              .limit(1)
+              .single();
+
+            if (tradeAudit) {
+              const existing = (tradeAudit.error_details as Record<string, unknown>) ?? {};
+              await supabase
+                .from('import_audit')
+                .update({
+                  error_details: { ...existing, processing_summary: processingSummary },
+                })
+                .eq('id', tradeAudit.id);
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to compute commission summary:', e);
+      }
     }
 
     setProgress(p => ({
