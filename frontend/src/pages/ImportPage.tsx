@@ -1,8 +1,10 @@
-import { useState, useCallback, type DragEvent } from 'react';
-import { Upload, FileText, AlertCircle, CheckCircle2, Loader2 } from 'lucide-react';
-import { useImport, type FileType } from '@/hooks/useImport';
+import { useState, useCallback, useEffect, type DragEvent } from 'react';
+import { Upload, FileText, AlertCircle, CheckCircle2, Loader2, Info, AlertTriangle } from 'lucide-react';
+import { useImport, type FileType, getImportState, validateDailyImportDate } from '@/hooks/useImport';
 import { ImportAuditLog } from '@/components/import/ImportAuditLog';
 import { ImportSummary } from '@/components/import/ImportSummary';
+import { ReconciliationResults } from '@/components/import/ReconciliationResults';
+import type { ImportState } from '@/lib/types';
 
 export function ImportPage() {
   const { progress, importFile, processTrades, reset, lastAuditId } = useImport();
@@ -10,6 +12,22 @@ export function ImportPage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileType, setFileType] = useState<FileType | ''>('');
   const [asOfDate, setAsOfDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [importState, setImportState] = useState<ImportState | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [validationWarning, setValidationWarning] = useState<string | null>(null);
+
+  // Load import state on mount and after imports complete
+  const refreshImportState = useCallback(async () => {
+    const state = await getImportState();
+    setImportState(state);
+  }, []);
+
+  useEffect(() => { refreshImportState(); }, [refreshImportState]);
+  useEffect(() => {
+    if (progress.stage === 'done' || progress.stage === 'reconciliation') {
+      refreshImportState();
+    }
+  }, [progress.stage, refreshImportState]);
 
   const handleDrop = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -40,7 +58,23 @@ export function ImportPage() {
 
   const handleUpload = async () => {
     if (!selectedFile || !fileType) return;
-    await importFile(selectedFile, fileType as FileType, asOfDate);
+    setValidationError(null);
+    setValidationWarning(null);
+
+    // Validate daily imports (trades, deposits) against baseline
+    const ft = fileType as FileType;
+    if (ft !== 'ADMIN_BALANCE') {
+      const validation = await validateDailyImportDate(ft, asOfDate);
+      if (!validation.ok) {
+        setValidationError(validation.error!);
+        return;
+      }
+      if (validation.warning) {
+        setValidationWarning(validation.warning);
+      }
+    }
+
+    await importFile(selectedFile, ft, asOfDate);
   };
 
   const handleProcessTrades = async () => {
@@ -51,16 +85,55 @@ export function ImportPage() {
     reset();
     setSelectedFile(null);
     setFileType('');
+    setValidationError(null);
+    setValidationWarning(null);
   };
 
   const isIdle = progress.stage === 'idle';
   const isDone = progress.stage === 'done';
   const isError = progress.stage === 'error';
+  const isReconciliation = progress.stage === 'reconciliation';
   const isWorking = ['parsing', 'uploading', 'processing'].includes(progress.stage);
+
+  // Compute next expected date (simple +1 day, skipping nothing — user handles weekends/holidays)
+  const nextExpectedDate = importState?.last_processed_date
+    ? (() => {
+        const d = new Date(importState.last_processed_date + 'T00:00:00');
+        d.setDate(d.getDate() + 1);
+        return d.toISOString().slice(0, 10);
+      })()
+    : null;
 
   return (
     <div>
       <h1 className="text-2xl font-bold mb-6">Import Data</h1>
+
+      {/* Import State Bar */}
+      <div className="mb-4 px-4 py-3 rounded-lg border border-border bg-card text-sm">
+        {importState?.baseline_date ? (
+          <div className="flex flex-wrap gap-x-6 gap-y-1 items-center">
+            <span>
+              <span className="text-muted-foreground">Baseline:</span>{' '}
+              <span className="font-medium">{importState.baseline_date}</span>
+            </span>
+            <span>
+              <span className="text-muted-foreground">Last Processed:</span>{' '}
+              <span className="font-medium">{importState.last_processed_date ?? '—'}</span>
+            </span>
+            {nextExpectedDate && (
+              <span>
+                <span className="text-muted-foreground">Next Expected:</span>{' '}
+                <span className="font-medium">{nextExpectedDate}</span>
+              </span>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-muted-foreground">
+            <Info size={16} />
+            No baseline imported yet. Import an Admin Balance CSV to start.
+          </div>
+        )}
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
         {/* Upload Zone */}
@@ -132,6 +205,20 @@ export function ImportPage() {
                 </p>
               </div>
 
+              {/* Validation messages */}
+              {validationError && (
+                <div className="flex items-start gap-2 px-3 py-2 rounded-md bg-destructive/10 text-destructive text-sm">
+                  <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                  <span>{validationError}</span>
+                </div>
+              )}
+              {validationWarning && !validationError && (
+                <div className="flex items-start gap-2 px-3 py-2 rounded-md bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 text-sm">
+                  <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+                  <span>{validationWarning}</span>
+                </div>
+              )}
+
               <div className="flex gap-2">
                 <button
                   onClick={handleUpload}
@@ -140,7 +227,7 @@ export function ImportPage() {
                 >
                   {isWorking ? 'Processing...' : 'Upload & Parse'}
                 </button>
-                {(isDone || isError) && (
+                {(isDone || isError || isReconciliation) && (
                   <button
                     onClick={handleReset}
                     className="px-4 py-2 bg-secondary text-secondary-foreground rounded-md text-sm"
@@ -218,6 +305,29 @@ export function ImportPage() {
             </div>
           )}
 
+          {isReconciliation && progress.reconciliationResult && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm text-blue-600">
+                <Info size={16} />
+                Reconciliation complete — baseline already exists, data was compared (not imported)
+              </div>
+              <div className="grid grid-cols-2 gap-3 text-center">
+                <div className="bg-success/10 rounded p-2">
+                  <p className="text-lg font-semibold text-success">
+                    {progress.reconciliationResult.matchedHoldings + progress.reconciliationResult.matchedCash}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Matched</p>
+                </div>
+                <div className="bg-destructive/10 rounded p-2">
+                  <p className="text-lg font-semibold text-destructive">
+                    {progress.reconciliationResult.holdingMismatches.length + progress.reconciliationResult.cashMismatches.length}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Mismatches</p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {isError && (
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-sm text-destructive">
@@ -229,6 +339,13 @@ export function ImportPage() {
           )}
         </div>
       </div>
+
+      {/* Reconciliation Results (shown when admin balance compared against existing baseline) */}
+      {isReconciliation && progress.reconciliationResult && (
+        <div className="mb-8">
+          <ReconciliationResults result={progress.reconciliationResult} />
+        </div>
+      )}
 
       {/* Data Summary */}
       <div className="mb-8">

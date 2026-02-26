@@ -115,22 +115,23 @@ Deno.serve(async (req) => {
           throw new Error(`Cannot resolve client for bo_id=${raw.bo_id}, client_code=${raw.client_code}`);
         }
 
-        // Step 3b: Income/KYC gate — block margin trades for ineligible clients
-        const { data: clientInfo } = await supabase
-          .from('clients')
-          .select('account_type, income_status, kyc_completed')
-          .eq('client_id', clientId)
-          .single();
-
-        if (clientInfo?.account_type === 'Margin') {
-          const blockedStatuses = ['student', 'homemaker', 'retired'];
-          if (clientInfo.income_status && blockedStatuses.includes(clientInfo.income_status.toLowerCase())) {
-            throw new Error(`Margin trade rejected: client income_status="${clientInfo.income_status}" is not eligible for margin trading (BSEC Section 5)`);
-          }
-          if (clientInfo.kyc_completed === false) {
-            throw new Error('Margin trade rejected: client KYC is not completed');
-          }
-        }
+        // Step 3b: Income/KYC gate — disabled for Phase 1 (KYC data not yet populated)
+        // TODO Phase 2: re-enable after KYC data is imported
+        // const { data: clientInfo } = await supabase
+        //   .from('clients')
+        //   .select('account_type, income_status, kyc_completed')
+        //   .eq('client_id', clientId)
+        //   .single();
+        //
+        // if (clientInfo?.account_type === 'Margin') {
+        //   const blockedStatuses = ['student', 'homemaker', 'retired'];
+        //   if (clientInfo.income_status && blockedStatuses.includes(clientInfo.income_status.toLowerCase())) {
+        //     throw new Error(`Margin trade rejected: client income_status="${clientInfo.income_status}" is not eligible for margin trading (BSEC Section 5)`);
+        //   }
+        //   if (clientInfo.kyc_completed === false) {
+        //     throw new Error('Margin trade rejected: client KYC is not completed');
+        //   }
+        // }
 
         // Step 4: Resolve security — prefer existing record to stay
         // consistent with holdings imported from admin balance

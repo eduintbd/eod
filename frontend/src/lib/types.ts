@@ -120,6 +120,7 @@ export interface CashLedgerEntry {
   type: string;
   reference: string | null;
   narration: string | null;
+  import_audit_id: number | null;
   created_at: string;
 }
 
@@ -135,6 +136,46 @@ export interface ImportAudit {
   error_details: Record<string, unknown> | null;
   status: 'PROCESSING' | 'SUCCESS' | 'PARTIAL' | 'FAILED';
   imported_by: string | null;
+}
+
+export interface ImportState {
+  id: number;
+  baseline_date: string | null;
+  last_processed_date: string | null;
+  baseline_import_audit_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Reconciliation result types
+export interface HoldingMismatch {
+  client_id: string;
+  client_name: string | null;
+  bo_id: string | null;
+  isin: string;
+  security_code: string | null;
+  file_qty: number;
+  db_qty: number;
+  diff_qty: number;
+  file_avg_cost: number;
+  db_avg_cost: number;
+  diff_avg_cost: number;
+}
+
+export interface CashMismatch {
+  client_id: string;
+  client_name: string | null;
+  bo_id: string | null;
+  file_balance: number;
+  db_balance: number;
+  diff: number;
+}
+
+export interface ReconciliationResult {
+  holdingMismatches: HoldingMismatch[];
+  cashMismatches: CashMismatch[];
+  matchedHoldings: number;
+  matchedCash: number;
 }
 
 // === Market Data types (from source project: ucb csm, schema: dse_market_data) ===

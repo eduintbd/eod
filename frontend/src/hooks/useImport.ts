@@ -4,18 +4,101 @@ import { parseDseXml } from '@/parsers/dse-xml-parser';
 import { parseCseText } from '@/parsers/cse-text-parser';
 import { parseAdminBalance } from '@/parsers/admin-balance-parser';
 import { parseDepositXlsx } from '@/parsers/deposit-parser';
-import type { RawTrade, ImportAudit } from '@/lib/types';
+import type { RawTrade, ImportAudit, ImportState, ReconciliationResult } from '@/lib/types';
 
 export type FileType = 'DSE_TRADE' | 'CSE_TRADE' | 'ADMIN_BALANCE' | 'DEPOSIT_WITHDRAWAL';
 
 export interface ImportProgress {
-  stage: 'idle' | 'parsing' | 'uploading' | 'processing' | 'done' | 'error';
+  stage: 'idle' | 'parsing' | 'uploading' | 'processing' | 'done' | 'error' | 'reconciliation';
   message?: string;
   totalRows: number;
   uploadedRows: number;
   processedRows: number;
   rejectedRows: number;
   errorMessage?: string;
+  reconciliationResult?: ReconciliationResult;
+}
+
+export interface DateValidation {
+  ok: boolean;
+  error?: string;    // blocking
+  warning?: string;  // non-blocking
+}
+
+// ── Import state helpers ──
+
+export async function getImportState(): Promise<ImportState | null> {
+  const { data, error } = await supabase
+    .from('import_state')
+    .select('*')
+    .eq('id', 1)
+    .single();
+
+  if (error || !data) return null;
+  return data as ImportState;
+}
+
+export async function validateDailyImportDate(
+  fileType: FileType,
+  dateStr: string,
+): Promise<DateValidation> {
+  const state = await getImportState();
+
+  if (!state?.baseline_date) {
+    return { ok: false, error: 'No baseline imported yet. Import an Admin Balance CSV first.' };
+  }
+
+  if (dateStr <= state.baseline_date) {
+    return {
+      ok: false,
+      error: `Cannot import for ${dateStr} — on or before baseline date (${state.baseline_date}). Daily imports must be after the baseline.`,
+    };
+  }
+
+  const warnings: string[] = [];
+
+  // Gap warning
+  const lastDate = state.last_processed_date || state.baseline_date;
+  const lastMs = new Date(lastDate).getTime();
+  const importMs = new Date(dateStr).getTime();
+  const gapDays = Math.round((importMs - lastMs) / (1000 * 60 * 60 * 24));
+  if (gapDays > 4) {
+    warnings.push(`${gapDays}-day gap since last processed date (${lastDate}). Missing trading days?`);
+  }
+
+  // Duplicate file_type + data_date warning
+  const mappedType = fileType === 'DSE_TRADE' || fileType === 'CSE_TRADE' ? fileType : fileType;
+  const { data: existing } = await supabase
+    .from('import_audit')
+    .select('id')
+    .eq('file_type', mappedType)
+    .eq('data_date', dateStr)
+    .eq('status', 'SUCCESS')
+    .limit(1);
+
+  if (existing && existing.length > 0) {
+    if (fileType === 'DEPOSIT_WITHDRAWAL') {
+      warnings.push(`A successful ${fileType} import for ${dateStr} already exists. It will be replaced.`);
+    } else {
+      warnings.push(`A successful ${fileType} import for ${dateStr} already exists. May create duplicates.`);
+    }
+  }
+
+  return {
+    ok: true,
+    warning: warnings.length > 0 ? warnings.join(' ') : undefined,
+  };
+}
+
+async function updateLastProcessedDate(dateStr: string): Promise<void> {
+  // Only advance forward, never backward
+  const { error } = await supabase
+    .from('import_state')
+    .update({ last_processed_date: dateStr })
+    .eq('id', 1)
+    .or(`last_processed_date.is.null,last_processed_date.lt.${dateStr}`);
+
+  if (error) console.error('Failed to update last_processed_date:', error.message);
 }
 
 const BATCH_SIZE = 500;
@@ -130,7 +213,7 @@ export function useImport() {
       setLastAuditId(auditId);
 
       if (type === 'DSE_TRADE' || type === 'CSE_TRADE') {
-        await importTradeFile(file, type, auditId);
+        await importTradeFile(file, type, auditId, dateStr);
       } else if (type === 'ADMIN_BALANCE') {
         await importAdminBalance(file, auditId, dateStr);
       } else if (type === 'DEPOSIT_WITHDRAWAL') {
@@ -156,7 +239,7 @@ export function useImport() {
     }
   }, []);
 
-  const importTradeFile = async (file: File, type: FileType, auditId: number) => {
+  const importTradeFile = async (file: File, type: FileType, auditId: number, dateStr: string) => {
     // DSE XML files use ISO-8859-1 encoding
     const encoding = type === 'DSE_TRADE' ? 'ISO-8859-1' : undefined;
     const text = await readFileAsText(file, encoding);
@@ -230,6 +313,11 @@ export function useImport() {
       })
       .eq('id', auditId);
 
+    // Update last_processed_date for this trade date
+    if (status === 'SUCCESS' || status === 'PARTIAL') {
+      await updateLastProcessedDate(dateStr);
+    }
+
     setProgress(p => ({
       ...p,
       stage: 'done',
@@ -242,6 +330,15 @@ export function useImport() {
     const text = await readFileAsText(file);
     const parsed = parseAdminBalance(text);
 
+    // ── Baseline guard: check if a baseline already exists ──
+    const state = await getImportState();
+    if (state?.baseline_date) {
+      // Switch to reconciliation mode — compare file vs DB, no overwrite
+      await importAdminBalanceReconcile(parsed, auditId, dateStr, state);
+      return;
+    }
+
+    // ── Normal first-time baseline import ──
     const totalRows = parsed.clients.length + parsed.holdings.length;
     setProgress(p => ({ ...p, totalRows, stage: 'uploading', message: 'Upserting clients...' }));
 
@@ -319,7 +416,8 @@ export function useImport() {
         amount: c.ledger_balance,
         running_balance: c.ledger_balance,
         type: 'OPENING_BALANCE',
-        narration: `Opening balance from admin balance import (${dateStr})`,
+        narration: `Closing balance as of ${dateStr} (baseline for daily processing)`,
+        import_audit_id: auditId,
       }));
 
     for (let i = 0; i < cashRows.length; i += BATCH_SIZE) {
@@ -381,6 +479,7 @@ export function useImport() {
         total_invested: h.total_cost,
         realized_pl: 0,
         as_of_date: dateStr,
+        import_audit_id: auditId,
       }));
 
     const skippedHoldings = parsed.holdings.length - holdingRows.length;
@@ -402,18 +501,30 @@ export function useImport() {
       setProgress(p => ({ ...p, uploadedRows: processedCount }));
     }
 
-    // ── Final: Update audit record ──
-    const status = errors.length > 0
+    // ── Set baseline in import_state ──
+    const finalStatus = errors.length > 0
       ? (processedCount > 0 ? 'PARTIAL' : 'FAILED')
       : 'SUCCESS';
 
+    if (finalStatus === 'SUCCESS' || finalStatus === 'PARTIAL') {
+      await supabase
+        .from('import_state')
+        .update({
+          baseline_date: dateStr,
+          last_processed_date: dateStr,
+          baseline_import_audit_id: auditId,
+        })
+        .eq('id', 1);
+    }
+
+    // ── Final: Update audit record ──
     await supabase
       .from('import_audit')
       .update({
         total_rows: totalRows,
         processed_rows: processedCount,
         rejected_rows: totalRows - processedCount,
-        status,
+        status: finalStatus,
         error_details: errors.length > 0 ? { errors: errors.slice(0, 50) } : null,
       })
       .eq('id', auditId);
@@ -427,6 +538,188 @@ export function useImport() {
     }));
   };
 
+  // ── Reconciliation mode: compare file vs DB, no overwrite ──
+  const importAdminBalanceReconcile = async (
+    parsed: ReturnType<typeof parseAdminBalance>,
+    auditId: number,
+    _dateStr: string,
+    _state: ImportState,
+  ) => {
+    setProgress(p => ({
+      ...p,
+      stage: 'uploading',
+      message: 'Reconciliation mode — comparing file with database...',
+      totalRows: parsed.clients.length + parsed.holdings.length,
+    }));
+
+    const errors: string[] = [];
+
+    // Build bo_id → client_id + name lookup
+    const boIds = parsed.clients.map(c => c.bo_id);
+    const clientMap = new Map<string, { client_id: string; name: string | null }>();
+
+    for (let i = 0; i < boIds.length; i += LOOKUP_BATCH) {
+      const batch = boIds.slice(i, i + LOOKUP_BATCH);
+      const { data } = await supabase
+        .from('clients')
+        .select('client_id, bo_id, name')
+        .in('bo_id', batch);
+      if (data) {
+        for (const row of data) clientMap.set(row.bo_id, { client_id: row.client_id, name: row.name });
+      }
+    }
+
+    // Build security_code → isin lookup
+    const uniqueSecCodes = [...new Set(parsed.holdings.map(h => h.security_code))];
+    const secMap = new Map<string, string>();
+
+    for (let i = 0; i < uniqueSecCodes.length; i += LOOKUP_BATCH) {
+      const batch = uniqueSecCodes.slice(i, i + LOOKUP_BATCH);
+      const { data } = await supabase
+        .from('securities')
+        .select('isin, security_code')
+        .in('security_code', batch);
+      if (data) {
+        for (const row of data) secMap.set(row.security_code, row.isin);
+      }
+    }
+
+    // ── Compare holdings ──
+    setProgress(p => ({ ...p, message: 'Comparing holdings...' }));
+    const holdingMismatches: ReconciliationResult['holdingMismatches'] = [];
+    let matchedHoldings = 0;
+
+    // Fetch DB holdings for all relevant clients
+    const allClientIds = [...new Set(
+      boIds.map(b => clientMap.get(b)?.client_id).filter((id): id is string => id != null)
+    )];
+    const dbHoldings = new Map<string, { quantity: number; average_cost: number }>();
+
+    for (let i = 0; i < allClientIds.length; i += LOOKUP_BATCH) {
+      const batch = allClientIds.slice(i, i + LOOKUP_BATCH);
+      const { data } = await supabase
+        .from('holdings')
+        .select('client_id, isin, quantity, average_cost')
+        .in('client_id', batch);
+      if (data) {
+        for (const row of data) {
+          dbHoldings.set(`${row.client_id}:${row.isin}`, {
+            quantity: row.quantity,
+            average_cost: Number(row.average_cost),
+          });
+        }
+      }
+    }
+
+    for (const h of parsed.holdings) {
+      const client = clientMap.get(h.bo_id);
+      const isin = secMap.get(h.security_code);
+      if (!client || !isin) continue;
+
+      const key = `${client.client_id}:${isin}`;
+      const dbH = dbHoldings.get(key);
+      const dbQty = dbH?.quantity ?? 0;
+      const dbAvg = dbH?.average_cost ?? 0;
+
+      if (h.quantity !== dbQty || Math.abs(h.average_cost - dbAvg) > 0.01) {
+        holdingMismatches.push({
+          client_id: client.client_id,
+          client_name: client.name,
+          bo_id: h.bo_id,
+          isin,
+          security_code: h.security_code,
+          file_qty: h.quantity,
+          db_qty: dbQty,
+          diff_qty: h.quantity - dbQty,
+          file_avg_cost: h.average_cost,
+          db_avg_cost: dbAvg,
+          diff_avg_cost: h.average_cost - dbAvg,
+        });
+      } else {
+        matchedHoldings++;
+      }
+    }
+
+    // ── Compare cash balances ──
+    setProgress(p => ({ ...p, message: 'Comparing cash balances...' }));
+    const cashMismatches: ReconciliationResult['cashMismatches'] = [];
+    let matchedCash = 0;
+
+    // Get latest running_balance per client from DB
+    const dbBalances = new Map<string, number>();
+    for (let i = 0; i < allClientIds.length; i += LOOKUP_BATCH) {
+      const batch = allClientIds.slice(i, i + LOOKUP_BATCH);
+      const { data } = await supabase
+        .from('cash_ledger')
+        .select('client_id, running_balance')
+        .in('client_id', batch)
+        .order('id', { ascending: false });
+      if (data) {
+        for (const row of data) {
+          if (!dbBalances.has(row.client_id)) {
+            dbBalances.set(row.client_id, Number(row.running_balance));
+          }
+        }
+      }
+    }
+
+    for (const c of parsed.clients) {
+      const client = clientMap.get(c.bo_id);
+      if (!client) continue;
+
+      const dbBal = dbBalances.get(client.client_id) ?? 0;
+      const fileBal = c.ledger_balance;
+
+      if (Math.abs(fileBal - dbBal) > 0.01) {
+        cashMismatches.push({
+          client_id: client.client_id,
+          client_name: client.name,
+          bo_id: c.bo_id,
+          file_balance: fileBal,
+          db_balance: dbBal,
+          diff: fileBal - dbBal,
+        });
+      } else {
+        matchedCash++;
+      }
+    }
+
+    const reconciliation: ReconciliationResult = {
+      holdingMismatches,
+      cashMismatches,
+      matchedHoldings,
+      matchedCash,
+    };
+
+    // Update audit as reconciliation (not a real import)
+    await supabase
+      .from('import_audit')
+      .update({
+        total_rows: parsed.clients.length + parsed.holdings.length,
+        processed_rows: 0,
+        rejected_rows: 0,
+        status: 'SUCCESS',
+        error_details: {
+          mode: 'reconciliation',
+          holding_mismatches: holdingMismatches.length,
+          cash_mismatches: cashMismatches.length,
+          matched_holdings: matchedHoldings,
+          matched_cash: matchedCash,
+          errors: errors.slice(0, 50),
+        },
+      })
+      .eq('id', auditId);
+
+    setProgress(p => ({
+      ...p,
+      stage: 'reconciliation',
+      message: undefined,
+      processedRows: matchedHoldings + matchedCash,
+      rejectedRows: holdingMismatches.length + cashMismatches.length,
+      reconciliationResult: reconciliation,
+    }));
+  };
+
   const importDeposits = async (file: File, auditId: number, dateStr: string) => {
     const buffer = await readFileAsBuffer(file);
     const deposits = parseDepositXlsx(buffer, file.name);
@@ -435,15 +728,51 @@ export function useImport() {
 
     const errors: string[] = [];
 
+    // ── Step 0: Check for existing deposit import for this date (replace-import dedup) ──
+    const { data: existingAudits } = await supabase
+      .from('import_audit')
+      .select('id')
+      .eq('file_type', 'DEPOSIT_WITHDRAWAL')
+      .eq('data_date', dateStr)
+      .eq('status', 'SUCCESS');
+
+    const oldAuditIds = (existingAudits ?? []).map(a => a.id).filter(id => id !== auditId);
+    let replacedClients = new Set<string>();
+
+    if (oldAuditIds.length > 0) {
+      setProgress(p => ({ ...p, message: 'Replacing previous deposit import for this date...' }));
+
+      // Collect affected client_ids before deleting
+      for (const oldId of oldAuditIds) {
+        const { data: oldEntries } = await supabase
+          .from('cash_ledger')
+          .select('client_id')
+          .eq('import_audit_id', oldId);
+        if (oldEntries) {
+          for (const e of oldEntries) replacedClients.add(e.client_id);
+        }
+
+        // Delete old entries
+        await supabase
+          .from('cash_ledger')
+          .delete()
+          .eq('import_audit_id', oldId);
+
+        // Mark old audit as replaced
+        await supabase
+          .from('import_audit')
+          .update({ status: 'FAILED', error_details: { replaced_by: auditId } })
+          .eq('id', oldId);
+      }
+    }
+
     // ── Step 1: Build client lookup map (batched) ──
-    // Collect unique client identifiers from parsed deposits
     const clientCodes = [...new Set(deposits.map(d => d.client_code).filter((c): c is string => c != null))];
     const boIds = [...new Set(deposits.map(d => d.bo_id).filter((b): b is string => b != null))];
 
     const codeToClientId = new Map<string, string>();
     const boIdToClientId = new Map<string, string>();
 
-    // Lookup by client_code
     for (let i = 0; i < clientCodes.length; i += LOOKUP_BATCH) {
       const batch = clientCodes.slice(i, i + LOOKUP_BATCH);
       const { data, error } = await supabase
@@ -460,7 +789,6 @@ export function useImport() {
       }
     }
 
-    // Lookup by bo_id (if any deposits have it)
     for (let i = 0; i < boIds.length; i += LOOKUP_BATCH) {
       const batch = boIds.slice(i, i + LOOKUP_BATCH);
       const { data, error } = await supabase
@@ -477,7 +805,6 @@ export function useImport() {
       }
     }
 
-    // Resolve each deposit to a client_id
     function resolveClientId(d: { bo_id: string | null; client_code: string | null }): string | null {
       if (d.client_code && codeToClientId.has(d.client_code)) return codeToClientId.get(d.client_code)!;
       if (d.bo_id && boIdToClientId.has(d.bo_id)) return boIdToClientId.get(d.bo_id)!;
@@ -502,7 +829,6 @@ export function useImport() {
 
       if (data) {
         for (const row of data) {
-          // Keep only the first (latest) balance per client
           if (!balanceMap.has(row.client_id)) {
             balanceMap.set(row.client_id, row.running_balance);
           }
@@ -513,7 +839,6 @@ export function useImport() {
     // ── Step 3: Build cash ledger rows with running balances ──
     setProgress(p => ({ ...p, message: 'Preparing cash ledger entries...' }));
 
-    // Track running balance changes as we process (for correct sequential balances per client)
     const currentBalance = new Map<string, number>();
     for (const [cid, bal] of balanceMap) currentBalance.set(cid, bal);
 
@@ -542,6 +867,7 @@ export function useImport() {
         type: d.type,
         reference: d.reference,
         narration: d.narration,
+        import_audit_id: auditId,
       });
     }
 
@@ -564,6 +890,17 @@ export function useImport() {
       setProgress(p => ({ ...p, uploadedRows: processedCount }));
     }
 
+    // ── Step 5: Recalc running balance for clients affected by replace-import ──
+    if (replacedClients.size > 0) {
+      setProgress(p => ({ ...p, message: `Recalculating balances for ${replacedClients.size} clients...` }));
+      for (const clientId of replacedClients) {
+        await supabase.rpc('recalc_running_balance', { p_client_id: clientId });
+      }
+    }
+
+    // ── Step 6: Update last_processed_date ──
+    await updateLastProcessedDate(dateStr);
+
     // ── Final: Update audit record ──
     const status = errors.length > 0
       ? (processedCount > 0 ? 'PARTIAL' : 'FAILED')
@@ -583,7 +920,9 @@ export function useImport() {
     setProgress(p => ({
       ...p,
       stage: 'done',
-      message: undefined,
+      message: oldAuditIds.length > 0
+        ? `Replaced previous import. ${replacedClients.size} client balances recalculated.`
+        : undefined,
       processedRows: processedCount,
       rejectedRows: deposits.length - processedCount,
     }));
@@ -664,5 +1003,5 @@ export function useImport() {
     return { processed_count: totalProcessed, failed_count: totalFailed };
   }, []);
 
-  return { progress, importFile, processTrades, reset, detectFileType, lastAuditId };
+  return { progress, importFile, processTrades, reset, detectFileType, lastAuditId, getImportState, validateDailyImportDate };
 }
