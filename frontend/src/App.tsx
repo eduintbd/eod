@@ -12,6 +12,7 @@ import { RiskDashboardPage } from '@/pages/RiskDashboardPage';
 import { AlertsPage } from '@/pages/AlertsPage';
 import { SettingsPage } from '@/pages/SettingsPage';
 import { EodSnapshotsPage } from '@/pages/EodSnapshotsPage';
+import { UnsettledIssuesPage } from '@/pages/UnsettledIssuesPage';
 
 function ProtectedRoutes() {
   const { user, loading } = useAuth();
@@ -40,6 +41,7 @@ function ProtectedRoutes() {
         <Route path="risk" element={<RiskDashboardPage />} />
         <Route path="risk/snapshots" element={<EodSnapshotsPage />} />
         <Route path="alerts" element={<AlertsPage />} />
+        <Route path="unsettled-issues" element={<UnsettledIssuesPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Routes>
     </AppLayout>

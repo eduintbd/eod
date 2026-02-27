@@ -7,6 +7,7 @@ import {
   TrendingUp,
   Shield,
   Bell,
+  AlertTriangle,
   Settings,
   LogOut,
 } from 'lucide-react';
@@ -20,6 +21,7 @@ const navItems = [
   { to: '/audit', icon: FileText, label: 'Import Audit' },
   { to: '/risk', icon: Shield, label: 'Risk & Margin' },
   { to: '/alerts', icon: Bell, label: 'Margin Alerts' },
+  { to: '/unsettled-issues', icon: AlertTriangle, label: 'Unsettled Issues' },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];
 
