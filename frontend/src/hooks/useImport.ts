@@ -424,12 +424,18 @@ export function useImport() {
       }
     }
 
+    // Admin balance as-of dateStr is the closing balance for that day,
+    // which becomes the opening balance for the next day.
+    const nextDay = new Date(dateStr + 'T00:00:00');
+    nextDay.setDate(nextDay.getDate() + 1);
+    const openingDate = nextDay.toISOString().slice(0, 10);
+
     const cashRows = parsed.clients
       .filter(c => c.ledger_balance !== 0 && clientMap.has(c.bo_id) && !existingOB.has(clientMap.get(c.bo_id)!))
       .map(c => ({
         client_id: clientMap.get(c.bo_id)!,
-        transaction_date: dateStr,
-        value_date: dateStr,
+        transaction_date: openingDate,
+        value_date: openingDate,
         amount: c.ledger_balance,
         running_balance: c.ledger_balance,
         type: 'OPENING_BALANCE',
