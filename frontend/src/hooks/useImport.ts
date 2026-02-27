@@ -510,8 +510,19 @@ export function useImport() {
       errors.push(`${skippedHoldings} holdings skipped (missing client or security mapping)`);
     }
 
-    for (let i = 0; i < holdingRows.length; i += BATCH_SIZE) {
-      const batch = holdingRows.slice(i, i + BATCH_SIZE);
+    // Deduplicate by (client_id, isin) — keep last occurrence (latest/amended row)
+    const dedupMap = new Map<string, (typeof holdingRows)[number]>();
+    for (const row of holdingRows) {
+      dedupMap.set(`${row.client_id}:${row.isin}`, row);
+    }
+    const dedupCount = holdingRows.length - dedupMap.size;
+    const dedupedRows = Array.from(dedupMap.values());
+    if (dedupCount > 0) {
+      errors.push(`${dedupCount} duplicate (client, instrument) rows merged (kept last occurrence)`);
+    }
+
+    for (let i = 0; i < dedupedRows.length; i += BATCH_SIZE) {
+      const batch = dedupedRows.slice(i, i + BATCH_SIZE);
       const { error } = await supabase
         .from('holdings')
         .upsert(batch, { onConflict: 'client_id,isin' });
