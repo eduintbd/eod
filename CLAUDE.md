@@ -8,13 +8,13 @@ UCB Stock CRM and Risk Management Platform — an internal system for UCB Stock 
 
 **Domain:** Bangladesh stock market (DSE — Dhaka Stock Exchange, CSE — Chittagong Stock Exchange). Currency is BDT. Regulatory authority is BSEC.
 
-**Status:** Phase 1 in progress. Database schema deployed, all 4 parsers built, trade processing Edge Function deployed, frontend scaffold with routing and pages complete.
+**Status:** Phase 1 complete, Phase 2 in progress. Database schema deployed, all 4 parsers built, trade processing and margin calculation engines deployed, frontend with 11 pages fully functional.
 
 ## Technology Stack
 
 - **Database:** Supabase (PostgreSQL) with Row Level Security
 - **Backend:** Supabase Edge Functions (Deno 2 / TypeScript)
-- **Frontend:** React + Vite + TypeScript + Tailwind CSS (no shadcn/ui primitives yet)
+- **Frontend:** React 19 + Vite + TypeScript + Tailwind CSS 4
 - **Auth:** Supabase Auth (email/password, role-based)
 - **Package Manager:** npm
 - **Version Control:** GitHub
@@ -27,7 +27,7 @@ Do NOT introduce Apache Airflow, RabbitMQ, or other complex infrastructure for P
 - **Project Ref:** zuupegtizrvbnsliuddu
 - **URL:** https://zuupegtizrvbnsliuddu.supabase.co
 - **Schema:** public (13 tables with RLS)
-- **Edge Functions:** `process-trades`, `sync-market-data`
+- **Edge Functions:** `process-trades`, `sync-market-data`, `calculate-margins`, `classify-marginability`, `enrich-securities`, `backfill-prices`
 
 ### Source (read-only market data): ucb csm
 - **Project Ref:** bbyrxqkoqeroymqlykcj
@@ -55,50 +55,135 @@ SUPABASE_ACCESS_TOKEN=<token> npx supabase@latest functions deploy <function-nam
 SUPABASE_ACCESS_TOKEN=<token> npx supabase@latest db push --include-all
 ```
 
-Note: On this machine, Node.js requires `export PATH="/c/Program Files/nodejs:$PATH"` before running npm/npx commands.
+## Project Structure
 
-## Sample Data Files
+```
+/eod/
+├── .env / .env.example                 # Environment variables (Supabase keys)
+├── CLAUDE.md                           # This file
+├── BSEC_MARGIN_RULES_2025_ANALYSIS.md  # Full regulatory breakdown
+├── package.json                        # Root dependencies (pg, xlsx)
+│
+├── frontend/
+│   └── src/
+│       ├── App.tsx                     # Router setup (React Router v7)
+│       ├── pages/                      # 11 pages (see Frontend Pages below)
+│       ├── components/
+│       │   ├── layout/                 # AppLayout, Sidebar
+│       │   └── import/                 # ImportSummary, ImportAuditLog
+│       ├── hooks/                      # Data fetching hooks (see Hooks below)
+│       ├── parsers/                    # 4 file parsers (DSE XML, CSE text, CSV, Excel)
+│       └── lib/
+│           ├── supabase.ts             # Main project client
+│           ├── supabase-market.ts      # Source project client (dse_market_data)
+│           ├── types.ts                # All TypeScript interfaces
+│           └── utils.ts                # Formatting helpers (BDT, numbers, %)
+│
+├── supabase/
+│   ├── config.toml                     # Local dev config
+│   ├── seed.sql                        # Seed data
+│   ├── migrations/                     # 5 migrations (schema, margin rules, alerts)
+│   └── functions/
+│       ├── process-trades/             # Main trade pipeline
+│       ├── calculate-margins/          # Margin ratio calc & alerts
+│       ├── classify-marginability/     # Security eligibility (BSEC Section 10/11)
+│       ├── sync-market-data/           # Price sync from source project
+│       ├── enrich-securities/          # DSE data scraping
+│       ├── backfill-prices/            # Historical price loader
+│       └── _shared/                    # cors, supabase-client, fee-calculator,
+│                                       # margin-rules, margin-config, settlement
+│
+└── scripts/                            # Maintenance scripts (Node.js .mjs)
+    ├── consolidated-trades.mjs         # Consolidate merchant bank/custodial trades
+    ├── cleanup-duplicates.mjs          # Remove duplicate trades by exec_id
+    ├── cleanup-remaining.mjs           # General cleanup
+    ├── investigate-failures.mjs        # Debug/query failed trades from DB
+    ├── process-remaining-trades.mjs    # Reprocess failed trades
+    └── reimport-deposits.mjs           # Reload deposit/withdrawal transactions
+```
 
-| File | Format | Description |
-|------|--------|-------------|
-| `20260201-144801-trades-UBR-out.xml` | XML | DSE trade file (~30MB, 71K+ lines). Key attributes: Action, Status, OrderID, ExecID, Side, BOID, ISIN, Quantity, Price, Value |
-| `Admin Balance 31.01.2026 fixed.csv` | CSV | Client portfolio balances (~16MB, 81K+ rows). Fields: Investor Code, BOID, Instrument, Holdings, AvgCost, Market Value, Ledger Balance |
-| `BT_WITH_TRADE_FLAG.txt` | Pipe-delimited | CSE trade file. Field mapping must be confirmed from this sample before building the parser |
-| `Deposit Withdrawal 01.02.2026.xlsx` | Excel | Daily deposit/withdrawal transactions |
+## What Has Been Built
 
-## Authoritative Specification
+### Frontend Pages (all functional)
 
-`UCB Stock - CRM & Risk Management Platform - Developer Instructions v1.0 (1).pdf` — this 19-page PDF is the single source of truth for all business rules, database schema, data ingestion pipeline, margin rules, fee structures, and implementation phases. Always consult it before making architectural decisions.
+| Route | Page | Description |
+|-------|------|-------------|
+| `/login` | LoginPage | Email/password authentication |
+| `/` | DashboardPage | Stats cards, recent imports, market summary (top gainers/losers) |
+| `/import` | ImportPage | Drag-drop file upload, 3-stage flow: parse → upload → process |
+| `/clients` | ClientsPage | Searchable/filterable client list with pagination (50/page) |
+| `/clients/:id` | ClientDetailPage | Tabs: Holdings, Cash Ledger, Trade History, Margin Status |
+| `/market` | MarketDataPage | Stock price browser with filtering and sorting |
+| `/risk` | RiskDashboardPage | Margin risk summary: NORMAL/MARGIN_CALL/FORCE_SELL counts, filterable table |
+| `/alerts` | AlertsPage | Margin alert tracking with Active/Resolved filter and Resolve button |
+| `/audit` | AuditPage | Import audit log with error details |
+| `/settings` | SettingsPage | Admin config tabs: Fees, Margin, System |
+| `/risk/snapshots` | EodSnapshotsPage | Historical daily portfolio snapshots |
 
-## Database Schema (12 tables)
+### Frontend Hooks
 
-All tables require `created_at` and `updated_at` timestamps. Enable RLS where appropriate.
+| Hook | Purpose |
+|------|---------|
+| `useAuth` | Auth state, login/logout, session management |
+| `useImport` | File parsing & upload for all 4 file types |
+| `useMarketData` | `useAllLatestPrices`, `useLatestPrices` |
+| `useMarginData` | `useMarginAccounts`, `useMarginAccount` with status filters |
+| `useAlerts` | `useMarginAlerts` (paginated), `useResolveAlert` |
+| `useSnapshots` | `useClientSnapshots` for EOD history |
+| `useFeeSchedule` | Fee schedule CRUD |
+| `useMarginConfig` | Margin parameter CRUD |
 
-Core tables: `clients`, `securities`, `raw_trades` (staging), `trade_executions`, `holdings`, `cash_ledger`, `margin_accounts`, `margin_alerts`, `daily_prices`, `daily_snapshots`, `fee_schedule`, `import_audit`. A `corporate_actions` table is also specified for Phase 4.
+### File Parsers (all 4 complete)
 
-Key relationships:
-- `clients.bo_id` and `clients.client_code` are both unique identifiers — map both to a single client master
-- `securities.isin` is the canonical security identifier (consolidates DSE + CSE)
-- `holdings` has composite PK: `(client_id, isin)`
-- `cash_ledger` uses a ledger model (append-only entries, balance = running sum), NOT a single balance row
+| Parser | Input | Notes |
+|--------|-------|-------|
+| `dse-xml-parser` | DSE XML (~30MB, 70K+ lines) | Regex-based for performance (no DOMParser) |
+| `cse-text-parser` | CSE pipe-delimited text | Normalizes to same RawTrade structure |
+| `admin-balance-parser` | Admin Balance CSV (~16MB, 81K rows) | Extracts client info + holdings |
+| `deposit-parser` | Deposit/Withdrawal Excel (multi-sheet) | Handles both single Amount and split Debit/Credit columns |
+
+### Edge Functions (all 6 deployed)
+
+| Function | Purpose |
+|----------|---------|
+| `process-trades` | Main pipeline: raw_trades → validate → fees → settlement → holdings → cash_ledger |
+| `calculate-margins` | Margin ratio calculation, 3-tier status, alert generation, deadline enforcement |
+| `classify-marginability` | BSEC Section 10/11: 9 criteria for security eligibility |
+| `sync-market-data` | Sync daily_stock_eod from source → local daily_prices |
+| `enrich-securities` | Scrape DSE website for sector, category, P/E, market cap, etc. |
+| `backfill-prices` | Load historical prices for past dates |
+
+### Database (13 tables + margin_config)
+
+Core: `clients`, `securities`, `raw_trades`, `trade_executions`, `holdings`, `cash_ledger`, `margin_accounts`, `margin_alerts`, `daily_prices`, `daily_snapshots`, `fee_schedule`, `import_audit`, `import_state`, `app_users`, `margin_config`
+
+Key design decisions:
+- `cash_ledger` is append-only (balance = running sum), NOT a single balance row
+- `holdings` composite PK: `(client_id, isin)` — consolidated across DSE/CSE
+- `exec_id` deduplication ensures idempotent re-imports
+- RLS enforced: RM sees only assigned clients, Admin/Risk see all
+- `securities.isin` uses mixed formats: `DSE-<CODE>` (most common), `PLACEHOLDER-<CODE>` (some), and actual BD-format ISINs (e.g. `BD8601NAL004`)
+- `daily_prices` composite PK: `(isin, date)` with FK to `securities(isin)` and CHECK constraint on `source` (`'DSE'` or `'CSE'`)
+
+6 migrations applied:
+1. Initial 13-table schema with RLS policies
+2. `data_date` column on `import_audit`
+3. Trade summary SQL function (`get_import_summary()` — scoped to latest trade date and latest cash date)
+4. `margin_config` table + security marginability fields + margin_accounts enhancements
+5. Alert type constraint (DEADLINE_BREACH, EXPOSURE_BREACH)
+6. `import_state` singleton table, `recalc_running_balance()` function, deposit dedup support
 
 ## Critical Business Rules
 
 ### Trade Processing
-- **Only** Status = FILL or PF with Quantity > 0 affect positions/cash. All other statuses are informational.
-- **ExecID is the deduplication key.** Never process the same ExecID twice.
-- CSE trades must be normalized to the same internal structure as DSE trades.
-- Holdings are consolidated per client per ISIN regardless of exchange.
+- **Only** Status = FILL or PF with Quantity > 0 affect positions/cash
+- **ExecID is the deduplication key** — never process same ExecID twice
+- Holdings consolidated per client per ISIN regardless of exchange
 
 ### Holdings Update Logic
 - **BUY:** `new_avg = (old_qty * old_avg + buy_value_with_fees) / (old_qty + buy_qty)`
-- **SELL:** `realized_pl += (sell_net_value - average_cost * sell_qty)`, quantity decreases, average_cost does NOT change on sells
-- Commission MUST be included in average cost calculations.
-
-### Settlement Dates
-- Category A, B, G, N: T+2 business days
-- Category Z: T+3 business days (buy)
-- Spot trades (CompulsorySpot=true): T+0 sell, T+1 buy
+- **SELL:** `realized_pl += (sell_net_value - average_cost * sell_qty)`, average_cost does NOT change on sells
+- Commission MUST be included in average cost calculations
 
 ### Fee Computation (per trade)
 - Brokerage Commission: negotiable, max 1% (configurable in `fee_schedule`)
@@ -108,39 +193,99 @@ Key relationships:
 - **BUY cost** = value + commission + exchange_fee + cdbl_fee + ait
 - **SELL proceeds** = value - commission - exchange_fee - cdbl_fee - ait
 
+### Settlement Dates
+- Category A, B, G, N: T+2 business days
+- Category Z: T+3 business days (buy)
+- Spot trades (CompulsorySpot=true): T+0 sell, T+1 buy
+
 ### Margin Rules (BSEC 2025)
 Three threshold levels:
 1. **NORMAL:** equity >= 75% of margin finance (portfolio >= 175% of loan)
-2. **MARGIN CALL:** equity < 75% — immediate alert, notify client, track consecutive calls
-3. **FORCE SELL:** equity <= 50% (portfolio <= 150% of loan) — obligated to sell immediately, no prior notice
+2. **MARGIN CALL:** equity < 75% — immediate alert, 3-business-day deadline
+3. **FORCE SELL:** equity <= 50% (portfolio <= 150% of loan) — sell immediately
 
-Margin eligibility for securities: Category A on Main Board; Category B with >=5% annual dividend; Free Float Market Cap >= BDT 50 Crore; Trailing P/E <= 30 (or 2x sectoral median).
+Auto-escalation: MARGIN_CALL → FORCE_SELL if 3-business-day deadline passes.
 
-If overall market P/E > 20, all margin ratios cap at 1:0.5.
+Dynamic ratios by portfolio size: 5-10L → 1:0.5; 10L+ → 1:1. Market P/E > 20 caps all ratios at 1:0.5.
 
-## Data Ingestion Pipeline (10 steps)
+All thresholds configurable in `margin_config` table via Settings page.
 
-1. File Upload → 2. Parse & Stage into `raw_trades` → 3. Filter (FILL/PF only) & Validate → 4. Compute Fees → 5. Compute Settlement Date → 6. Update Holdings → 7. Update Cash Ledger → 8. Recalculate Margin → 9. Generate Alerts → 10. EOD Snapshot
+## What's Implemented vs Not Yet
 
-Error handling: mark failed trades individually, continue batch, support re-processing.
+### Fully Working
+- All 4 data parsers
+- Trade processing pipeline (raw → executions → holdings → cash)
+- Fee calculation (all 4 fee types, configurable)
+- Settlement date logic
+- Holdings averaging with fee inclusion
+- Margin calculation engine (equity ratio, status, dynamic ratios)
+- Margin alerts (MARGIN_CALL, FORCE_SELL, DEADLINE_BREACH)
+- 3-business-day margin call deadline enforcement
+- Security marginability classifier (9 criteria)
+- Market data sync from source project
+- All 11 frontend pages with data fetching and filtering
+- Auth + role-based RLS
+- File import UI with progress tracking
+- Settings page for fees & margin parameters
+- Import summary scoped to latest date (trades by trade_date, deposits by transaction_date)
+- Auto-creation of placeholder clients for unmatched deposit/withdrawal rows (lookup-first, insert-if-missing)
+- Import state tracking with baseline guard and deposit replace-import dedup
+- Running balance recalculation after deposit re-imports
+
+### Needs Enhancement (Phase 2)
+- Security marginability (needs fuller fundamental data from DSE)
+- Single-client exposure limit (code present, needs `core_capital_net_worth` configured)
+- Single-security exposure limit (infrastructure ready, needs activation)
+
+### Not Yet Built (Phase 2+)
+- 60-day forced sell on category downgrade
+- Unrealized gain restriction on margin expansion
+- Negative EPS exclusion from marginability
+- Going concern / qualified audit opinion tracking
+- SMS/WhatsApp notification channels
+- Margin agreement versioning & expiry
+- 1% general provisioning calculation
+- BSEC regulatory reporting (daily, top-20 clients)
+- Account closure workflow
+- Contract notes & statements (Phase 3)
+- Corporate actions (Phase 4)
+- Client portal (Phase 4)
 
 ## Implementation Phases
 
-- **Phase 1 (Weeks 1-4):** Core data integration — Supabase setup, all parsers (Excel/XML/Text), trade processor, basic portfolio view
-- **Phase 2 (Weeks 5-8):** Margin & risk engine — eligibility checks, ratio calculation, 3-level monitoring, alerts, force sell recommendations
-- **Phase 3 (Weeks 9-12):** Reporting & CRM — contract notes, statements, regulatory reports, CRM features, role management
-- **Phase 4 (Weeks 13+):** Corporate actions, automated price feeds, client portal, WhatsApp
-
-Do not jump to the next phase until the current phase is fully tested and approved.
+- **Phase 1 (Complete):** Core data integration — Supabase setup, all parsers, trade processor, portfolio views
+- **Phase 2 (In Progress):** Margin & risk engine — eligibility checks, ratio calculation, 3-level monitoring, alerts, force sell recommendations
+- **Phase 3 (Future):** Reporting & CRM — contract notes, statements, regulatory reports, CRM features, role management
+- **Phase 4 (Future):** Corporate actions, automated price feeds, client portal, WhatsApp
 
 ## User Roles
 
-Admin, Risk Manager, Relationship Manager (sees only assigned clients), Operations, Viewer. Enforce via Supabase RLS policies.
+Admin, Risk Manager, Relationship Manager (sees only assigned clients), Operations, Viewer. Enforced via Supabase RLS policies.
 
 ## Security Constraints
 
-- All cash/holdings changes must be audit-logged (timestamp, user, old value, new value)
+- All cash/holdings changes must be audit-logged
 - No direct deletion — use status flags and reversal transactions
 - File imports must be idempotent (re-import = no duplicates)
-- All business rule parameters must be configurable via admin panel without code changes
-- 30-minute session timeout
+- All business rule parameters configurable via admin panel without code changes
+- 30-minute session timeout (specified, not yet enforced)
+
+## Authoritative Specification
+
+`UCB Stock - CRM & Risk Management Platform - Developer Instructions v1.0 (1).pdf` — 19-page PDF is the single source of truth for all business rules, database schema, data pipeline, margin rules, fee structures, and implementation phases. Always consult it before making architectural decisions.
+
+## Data Loading Notes
+
+- **Historical prices** from `historical_prices_matched(2).csv` (397 rows, dated 2026-01-13) have been uploaded to `daily_prices` table via a one-time Node.js script. The CSV ISINs were mapped to existing `securities.isin` values using the `security_code` lookup.
+- When inserting into `daily_prices`, ensure ISINs exist in `securities` first (FK constraint). Some securities have `PLACEHOLDER-*` ISINs but their `security_code` matches the DSE symbol.
+- Use `Prefer: resolution=merge-duplicates` header for upserts on `daily_prices` (composite PK: `isin, date`).
+
+## Sample Data Files
+
+| File | Format | Description |
+|------|--------|-------------|
+| `20260201-144801-trades-UBR-out.xml` | XML | DSE trade file (~30MB, 71K+ lines) |
+| `Admin Balance 31.01.2026 fixed.csv` | CSV | Client portfolio balances (~16MB, 81K+ rows) |
+| `BT_WITH_TRADE_FLAG.txt` | Pipe-delimited | CSE trade file |
+| `Deposit Withdrawal 01.02.2026.xlsx` | Excel | Daily deposit/withdrawal transactions |
+| `historical_prices_matched(2).csv` | CSV | Historical OHLCV prices (397 rows, loaded into daily_prices) |
