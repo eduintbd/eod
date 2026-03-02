@@ -25,6 +25,7 @@ interface SummaryData {
   total_securities: number;
   trades_processed: number;
   trades_unprocessed: number;
+  trade_date: string | null;
 }
 
 function bdt(value: number): string {
@@ -77,7 +78,14 @@ export function ImportSummary() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h2 className="font-semibold">Data Summary</h2>
+        <h2 className="font-semibold">
+          Data Summary
+          {data.trade_date && (
+            <span className="text-sm font-normal text-muted-foreground ml-2">
+              — {data.trade_date}
+            </span>
+          )}
+        </h2>
         <button
           onClick={load}
           className="text-xs text-muted-foreground hover:text-foreground"
@@ -90,7 +98,9 @@ export function ImportSummary() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* DSE */}
         <div className="bg-card rounded-lg border border-border p-4">
-          <h3 className="text-sm font-medium text-muted-foreground mb-3">DSE Trades</h3>
+          <h3 className="text-sm font-medium text-muted-foreground mb-3">
+            DSE Trades{data.trade_date && <span className="ml-1">({data.trade_date})</span>}
+          </h3>
           <div className="space-y-2">
             <div className="flex justify-between items-baseline">
               <span className="text-xs text-muted-foreground">Buy</span>
@@ -119,7 +129,9 @@ export function ImportSummary() {
 
         {/* CSE */}
         <div className="bg-card rounded-lg border border-border p-4">
-          <h3 className="text-sm font-medium text-muted-foreground mb-3">CSE Trades</h3>
+          <h3 className="text-sm font-medium text-muted-foreground mb-3">
+            CSE Trades{data.trade_date && <span className="ml-1">({data.trade_date})</span>}
+          </h3>
           <div className="space-y-2">
             <div className="flex justify-between items-baseline">
               <span className="text-xs text-muted-foreground">Buy</span>

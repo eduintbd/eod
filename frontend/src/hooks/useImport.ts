@@ -845,6 +845,86 @@ export function useImport() {
       return null;
     }
 
+    // ── Step 1b: Auto-create placeholder clients for unmatched codes/BO IDs ──
+    const unmatchedDeposits = deposits.filter(d => !resolveClientId(d));
+    if (unmatchedDeposits.length > 0) {
+      setProgress(p => ({ ...p, message: `Resolving ${unmatchedDeposits.length} unmatched client(s)...` }));
+
+      // Deduplicate by client_code or bo_id
+      const seen = new Set<string>();
+      const toResolve: Array<{ bo_id: string | null; client_code: string }> = [];
+      for (const d of unmatchedDeposits) {
+        const key = d.client_code || d.bo_id || '';
+        if (seen.has(key)) continue;
+        seen.add(key);
+        toResolve.push({
+          bo_id: d.bo_id || null,
+          client_code: d.client_code || `UNKNOWN-${d.bo_id || key}`,
+        });
+      }
+
+      for (const c of toResolve) {
+        // First: try direct lookup (may exist but was missed by batch IN query)
+        let found = false;
+        if (c.client_code) {
+          const { data: byCode } = await supabase
+            .from('clients')
+            .select('client_id, client_code, bo_id')
+            .eq('client_code', c.client_code)
+            .single();
+          if (byCode) {
+            codeToClientId.set(byCode.client_code, byCode.client_id);
+            if (byCode.bo_id) boIdToClientId.set(byCode.bo_id, byCode.client_id);
+            found = true;
+          }
+        }
+        if (!found && c.bo_id) {
+          const { data: byBo } = await supabase
+            .from('clients')
+            .select('client_id, client_code, bo_id')
+            .eq('bo_id', c.bo_id)
+            .single();
+          if (byBo) {
+            if (byBo.client_code) codeToClientId.set(byBo.client_code, byBo.client_id);
+            boIdToClientId.set(byBo.bo_id, byBo.client_id);
+            found = true;
+          }
+        }
+
+        // Only create if truly not in DB
+        if (!found) {
+          const { data: newClient, error: createErr } = await supabase
+            .from('clients')
+            .insert({
+              bo_id: c.bo_id,
+              client_code: c.client_code,
+              name: `Placeholder - ${c.client_code !== c.bo_id ? c.client_code : c.bo_id}`,
+              status: 'pending_review',
+            })
+            .select('client_id, client_code, bo_id')
+            .single();
+
+          if (createErr) {
+            // Race condition: retry lookup
+            const { data: retry } = await supabase
+              .from('clients')
+              .select('client_id, client_code, bo_id')
+              .eq('client_code', c.client_code)
+              .single();
+            if (retry) {
+              codeToClientId.set(retry.client_code, retry.client_id);
+              if (retry.bo_id) boIdToClientId.set(retry.bo_id, retry.client_id);
+            } else {
+              errors.push(`Failed to create client ${c.client_code}: ${createErr.message}`);
+            }
+          } else if (newClient) {
+            if (newClient.client_code) codeToClientId.set(newClient.client_code, newClient.client_id);
+            if (newClient.bo_id) boIdToClientId.set(newClient.bo_id, newClient.client_id);
+          }
+        }
+      }
+    }
+
     // ── Step 2: Get latest running balance per client (batched) ──
     setProgress(p => ({ ...p, message: 'Fetching current balances...' }));
 
