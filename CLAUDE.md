@@ -280,6 +280,61 @@ Admin, Risk Manager, Relationship Manager (sees only assigned clients), Operatio
 - When inserting into `daily_prices`, ensure ISINs exist in `securities` first (FK constraint). Some securities have `PLACEHOLDER-*` ISINs but their `security_code` matches the DSE symbol.
 - Use `Prefer: resolution=merge-duplicates` header for upserts on `daily_prices` (composite PK: `isin, date`).
 
+## Session Summary — 2026-03-04: Unsettled Issues Amount Calculation Fix
+
+### Problem
+The "Amount" column on the `/unsettled-issues` Negative Balance tab was showing the raw `running_balance` from `cash_ledger` (e.g. -86.96 for client 20093). The correct amount must account for **all unprocessed trades (buys AND sells) plus brokerage commission** to show the projected liability.
+
+Additionally, clients with **positive** `running_balance` but unprocessed buy trades that would push them negative (e.g. client 9068 with balance +3,986.50) were completely missing from the page because the `get_negative_balance_clients` RPC only returned rows where `running_balance < 0`.
+
+### Formula
+```
+amount_payable = |running_balance - buy_total - (buy_total × commission_rate) + sell_total - (sell_total × commission_rate)|
+```
+
+### Solution — DB-side computation with `amount_payable` column
+
+Rather than computing on the frontend, the calculated amounts are now stored in the database.
+
+**Migration `00007_add_amount_payable.sql`:**
+1. Added `amount_payable NUMERIC DEFAULT 0` column to `cash_ledger`
+2. Created `compute_amount_payable()` function — recalculates for all clients by joining `cash_ledger` (latest row per client) + `raw_trades` (unprocessed, EXEC, PF/FILL) + `clients` (commission_rate). Updates the `amount_payable` on each client's latest ledger entry.
+3. Dropped and recreated `get_negative_balance_clients()` RPC — now returns `amount_payable` column and includes clients where `amount_payable > 0` (not just `running_balance < 0`), catching clients like 9068 who will go negative after trades settle.
+
+**Frontend `useUnsettledIssues.ts` changes:**
+- Calls `compute_amount_payable()` RPC on each page load (before fetching data) to ensure fresh values
+- Reads `amount_payable` directly from the RPC result instead of computing on the frontend
+- `NegativeBalanceRow` interface updated with `amount_payable` field
+- Sort changed to descending (largest liability first)
+- All frontend-side trade fetching / computation code removed — DB handles it
+
+### Verification (all 8 test clients match CSV within <1 BDT)
+
+| Code | Balance | Buy Total | Sell Total | Comm Rate | Calculated | CSV |
+|------|---------|-----------|------------|-----------|------------|-----|
+| 20093 | -86.96 | 221,743.50 | 0 | 0.003 | 222,495.69 | 222,496 |
+| 9068 | 3,986.50 | 50,200 | 25,660 | 0.004 | 20,856.94 | 20,857 |
+| 22002 | -31,514.97 | 0 | 12,157.30 | 0.004 | 19,406.30 | 19,406 |
+| OBO5580 | -1,350.17 | 122,600 | 0 | 0.0045 | 124,501.87 | 124,502 |
+| 21858 | 36.08 | 48,750 | 0 | 0.004 | 48,908.92 | 48,909 |
+| 21775 | 22,075.50 | 31,650 | 0 | 0.004 | 9,701.10 | 9,701 |
+| OBO8440 | 1,020.80 | 3,730 | 0 | 0.004 | 2,724.12 | 2,724 |
+| OBO8881 | -2,066.44 | 0 | 0 | 0.004 | 2,066.44 | 2,066 |
+
+### Key details
+- `commission_rate` defaults to 0.003 if null in `clients` table
+- 10 clients with positive `running_balance` are now correctly included (they go negative after unprocessed trades)
+- `compute_amount_payable()` is called on every page load; could be optimized to run via cron or trigger if performance becomes a concern
+- Migration applied to live DB via `supabase db push`
+
+### Files modified
+| File | Change |
+|------|--------|
+| `supabase/migrations/00007_add_amount_payable.sql` | New migration: column + 2 functions |
+| `frontend/src/hooks/useUnsettledIssues.ts` | Simplified to read `amount_payable` from DB |
+
+---
+
 ## Sample Data Files
 
 | File | Format | Description |

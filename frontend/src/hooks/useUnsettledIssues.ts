@@ -35,6 +35,7 @@ interface NegativeBalanceRow {
   reference: string | null;
   narration: string | null;
   ledger_id: number;
+  amount_payable: number;
 }
 
 interface CashLedgerRow {
@@ -71,7 +72,11 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
     setError(null);
 
     try {
-      // Step 1: Get clients with negative balances via RPC (paginated)
+      // Step 1: Recompute amount_payable in the DB before fetching
+      const { error: computeErr } = await supabase.rpc('compute_amount_payable');
+      if (computeErr) throw new Error(`compute_amount_payable failed: ${computeErr.message}`);
+
+      // Step 2: Get clients with negative/unsettled balances via RPC (paginated)
       const allNegRows: NegativeBalanceRow[] = [];
       const RPC_PAGE = 1000;
       let rpcOffset = 0;
@@ -97,7 +102,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
       const negRows = allNegRows;
       const clientIds = negRows.map(r => r.client_id);
 
-      // Step 2: Get client details
+      // Step 3: Get client details
       const clientMap = new Map<string, {
         client_code: string | null;
         name: string | null;
@@ -117,7 +122,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         }
       }
 
-      // Step 3: Get RM names from app_users
+      // Step 4: Get RM names from app_users
       const rmIds = [...new Set(
         [...clientMap.values()].map(c => c.rm_id).filter(Boolean) as string[]
       )];
@@ -136,7 +141,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         }
       }
 
-      // Step 4: Get cash_ledger history ONLY for clients whose latest entry
+      // Step 5: Get cash_ledger history ONLY for clients whose latest entry
       // is a trade/withdrawal (not OPENING_BALANCE) to trace when balance went negative.
       // For OPENING_BALANCE entries, the event date is the transaction_date itself.
       const traceClientIds = negRows
@@ -162,7 +167,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         }
       }
 
-      // Step 5: Get margin data for loan ratios
+      // Step 6: Get margin data for loan ratios
       const marginMap = new Map<string, { loan_balance: number; margin_ratio: number }>();
       for (let i = 0; i < clientIds.length; i += 100) {
         const batch = clientIds.slice(i, i + 100);
@@ -175,7 +180,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         }
       }
 
-      // Step 6: Build issues list
+      // Step 7: Build issues list
       const today = new Date();
       const builtIssues: UnsettledIssue[] = [];
 
@@ -238,7 +243,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
           clientName: client.name || '',
           accountType: client.account_type || 'N/A',
           instruments,
-          amount: neg.running_balance,
+          amount: neg.amount_payable || Math.abs(neg.running_balance),
           loanRatio,
           rmName,
           nonComplianceType,
@@ -251,7 +256,7 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         });
       }
 
-      // Step 7: Compute RM frequency and disciplinary measures
+      // Step 8: Compute RM frequency and disciplinary measures
       // Only compute frequency for known RMs (not N/A)
       const rmFreqMap = new Map<string, number>();
       for (const issue of builtIssues) {
@@ -269,8 +274,8 @@ export function useUnsettledIssues(filters: UnsettledFilters = {}) {
         }
       }
 
-      // Sort by amount ascending (most negative first)
-      builtIssues.sort((a, b) => a.amount - b.amount);
+      // Sort by amount descending (largest liability first)
+      builtIssues.sort((a, b) => b.amount - a.amount);
 
       setIssues(builtIssues);
     } catch (err) {
