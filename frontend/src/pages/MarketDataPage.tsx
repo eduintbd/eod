@@ -52,10 +52,20 @@ export function MarketDataPage() {
   const [search, setSearch] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
+  const [syncDate, setSyncDate] = useState('');
+  const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [enriching, setEnriching] = useState(false);
   const [enrichResult, setEnrichResult] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);
   const [classifyResult, setClassifyResult] = useState<string | null>(null);
+
+  // Load available dates from source
+  useEffect(() => {
+    marketDb.from('daily_stock_eod').select('date').order('date', { ascending: false }).then(({ data }) => {
+      const unique = [...new Set((data ?? []).map(d => d.date as string))].sort().reverse();
+      setAvailableDates(unique);
+    });
+  }, []);
 
   const filtered = useMemo(() => {
     if (!search) return prices;
@@ -71,20 +81,24 @@ export function MarketDataPage() {
     setSyncing(true);
     setSyncResult(null);
     try {
-      // Get latest EOD date from source
-      const { data: dateRow, error: dateErr } = await marketDb
-        .from('daily_stock_eod')
-        .select('date')
-        .order('date', { ascending: false })
-        .limit(1)
-        .single();
-      if (dateErr) throw new Error(`Source date: ${dateErr.message}`);
+      // Use selected date or fetch latest
+      let targetDate = syncDate;
+      if (!targetDate) {
+        const { data: dateRow, error: dateErr } = await marketDb
+          .from('daily_stock_eod')
+          .select('date')
+          .order('date', { ascending: false })
+          .limit(1)
+          .single();
+        if (dateErr) throw new Error(`Source date: ${dateErr.message}`);
+        targetDate = dateRow.date;
+      }
 
       // Fetch all EOD data for that date
       const { data: eodData, error: eodErr } = await marketDb
         .from('daily_stock_eod')
         .select('symbol, date, close, volume')
-        .eq('date', dateRow.date);
+        .eq('date', targetDate);
       if (eodErr) throw new Error(`EOD fetch: ${eodErr.message}`);
 
       // Map symbol → isin from local securities
@@ -125,7 +139,7 @@ export function MarketDataPage() {
         priceUpdated += batch.length;
       }
 
-      setSyncResult(`Synced ${synced} prices for ${dateRow.date}, updated ${priceUpdated} securities.`);
+      setSyncResult(`Synced ${synced} prices for ${targetDate}, updated ${priceUpdated} securities.`);
       refresh();
       refreshSecurities();
     } catch (err) {
@@ -314,13 +328,23 @@ export function MarketDataPage() {
             <Database size={14} className={enriching ? 'animate-pulse' : ''} />
             {enriching ? 'Enriching...' : 'Enrich from DSE'}
           </button>
+          <select
+            value={syncDate}
+            onChange={e => setSyncDate(e.target.value)}
+            className="px-2 py-2 bg-card border border-border rounded-md text-sm"
+          >
+            <option value="">Latest date</option>
+            {availableDates.map(d => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
           <button
             onClick={handleSync}
             disabled={syncing}
             className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm hover:bg-primary/90 disabled:opacity-50"
           >
             <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
-            Sync to Local DB
+            Sync Prices
           </button>
           <button
             onClick={refresh}
