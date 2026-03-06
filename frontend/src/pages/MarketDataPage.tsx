@@ -3,7 +3,7 @@ import { RefreshCw, TrendingUp, Search, Database, ShieldCheck } from 'lucide-rea
 import { useAllLatestPrices, useFundamentals } from '@/hooks/useMarketData';
 import { marketDb } from '@/lib/supabase-market';
 import { formatNumber, formatBDT } from '@/lib/utils';
-import { supabase } from '@/lib/supabase';
+import { supabase, supabaseAdmin } from '@/lib/supabase';
 
 interface LocalSecurity {
   security_code: string;
@@ -108,7 +108,7 @@ export function MarketDataPage() {
       let synced = 0;
       for (let i = 0; i < priceRows.length; i += 500) {
         const batch = priceRows.slice(i, i + 500);
-        const { error: upErr } = await supabase.from('daily_prices').upsert(batch, { onConflict: 'isin,date' });
+        const { error: upErr } = await supabaseAdmin.from('daily_prices').upsert(batch, { onConflict: 'isin,date' });
         if (upErr) throw new Error(`Price upsert: ${upErr.message}`);
         synced += batch.length;
       }
@@ -120,7 +120,7 @@ export function MarketDataPage() {
       for (let i = 0; i < eodMatched.length; i += BATCH) {
         const batch = eodMatched.slice(i, i + BATCH);
         await Promise.all(batch.map(e =>
-          supabase.from('securities').update({ last_close_price: e.close }).eq('isin', codeToIsin[e.symbol.toUpperCase()])
+          supabaseAdmin.from('securities').update({ last_close_price: e.close }).eq('isin', codeToIsin[e.symbol.toUpperCase()])
         ));
         priceUpdated += batch.length;
       }
@@ -184,7 +184,7 @@ export function MarketDataPage() {
 
       for (let i = 0; i < pending.length; i += BATCH) {
         const batch = pending.slice(i, i + BATCH);
-        await Promise.all(batch.map(p => supabase.from('securities').update(p.updates).eq('isin', p.isin)));
+        await Promise.all(batch.map(p => supabaseAdmin.from('securities').update(p.updates).eq('isin', p.isin)));
         updated += batch.length;
       }
 
@@ -269,7 +269,7 @@ export function MarketDataPage() {
       for (let i = 0; i < updates.length; i += BATCH) {
         const batch = updates.slice(i, i + BATCH);
         await Promise.all(batch.map(u =>
-          supabase.from('securities').update({
+          supabaseAdmin.from('securities').update({
             is_marginable: u.is_marginable,
             marginability_reason: u.reason,
             marginability_updated_at: now,
