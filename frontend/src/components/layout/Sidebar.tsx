@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Settings,
   LogOut,
+  GraduationCap,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -22,6 +23,7 @@ const navItems = [
   { to: '/risk', icon: Shield, label: 'Risk & Margin' },
   { to: '/alerts', icon: Bell, label: 'Margin Alerts' },
   { to: '/unsettled-issues', icon: AlertTriangle, label: 'Unsettled Issues' },
+  { to: '/learn', icon: GraduationCap, label: 'Learning Center' },
   { to: '/settings', icon: Settings, label: 'Settings' },
 ];
 

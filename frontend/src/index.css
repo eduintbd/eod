@@ -37,3 +37,19 @@ body {
 #root {
   min-height: 100vh;
 }
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #certificate-print,
+  #certificate-print * {
+    visibility: visible;
+  }
+  #certificate-print {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+}

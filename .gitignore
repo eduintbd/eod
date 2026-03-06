@@ -9,3 +9,5 @@ Thumbs.db
 .claude/
 data/
 supabase/.temp/
+secrets.txt
+REPORTS/

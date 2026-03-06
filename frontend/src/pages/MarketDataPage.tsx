@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { RefreshCw, TrendingUp, Search, Database, ShieldCheck } from 'lucide-react';
 import { useAllLatestPrices, useFundamentals } from '@/hooks/useMarketData';
+import { marketDb } from '@/lib/supabase-market';
 import { formatNumber, formatBDT } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 
@@ -70,12 +71,62 @@ export function MarketDataPage() {
     setSyncing(true);
     setSyncResult(null);
     try {
-      const { data, error } = await supabase.functions.invoke('sync-market-data');
-      if (error) throw error;
-      setSyncResult(
-        `Synced ${data.prices_synced} prices, updated ${data.securities_updated} securities.` +
-        (data.errors?.length > 0 ? ` (${data.errors.length} errors)` : '')
-      );
+      // Get latest EOD date from source
+      const { data: dateRow, error: dateErr } = await marketDb
+        .from('daily_stock_eod')
+        .select('date')
+        .order('date', { ascending: false })
+        .limit(1)
+        .single();
+      if (dateErr) throw new Error(`Source date: ${dateErr.message}`);
+
+      // Fetch all EOD data for that date
+      const { data: eodData, error: eodErr } = await marketDb
+        .from('daily_stock_eod')
+        .select('symbol, date, close, volume')
+        .eq('date', dateRow.date);
+      if (eodErr) throw new Error(`EOD fetch: ${eodErr.message}`);
+
+      // Map symbol → isin from local securities
+      const { data: secs } = await supabase.from('securities').select('isin, security_code');
+      const codeToIsin: Record<string, string> = {};
+      for (const s of secs ?? []) {
+        if (s.security_code) codeToIsin[s.security_code.toUpperCase()] = s.isin;
+      }
+
+      // Upsert into daily_prices
+      const priceRows = (eodData ?? [])
+        .filter(e => codeToIsin[e.symbol?.toUpperCase()])
+        .map(e => ({
+          isin: codeToIsin[e.symbol.toUpperCase()],
+          date: e.date,
+          close_price: e.close,
+          volume: e.volume,
+          source: 'DSE',
+        }));
+
+      let synced = 0;
+      for (let i = 0; i < priceRows.length; i += 500) {
+        const batch = priceRows.slice(i, i + 500);
+        const { error: upErr } = await supabase.from('daily_prices').upsert(batch, { onConflict: 'isin,date' });
+        if (upErr) throw new Error(`Price upsert: ${upErr.message}`);
+        synced += batch.length;
+      }
+
+      // Update last_close_price on securities (batch via parallel updates)
+      let priceUpdated = 0;
+      const BATCH = 50;
+      const eodMatched = (eodData ?? []).filter(e => codeToIsin[e.symbol?.toUpperCase()]);
+      for (let i = 0; i < eodMatched.length; i += BATCH) {
+        const batch = eodMatched.slice(i, i + BATCH);
+        await Promise.all(batch.map(e =>
+          supabase.from('securities').update({ last_close_price: e.close }).eq('isin', codeToIsin[e.symbol.toUpperCase()])
+        ));
+        priceUpdated += batch.length;
+      }
+
+      setSyncResult(`Synced ${synced} prices for ${dateRow.date}, updated ${priceUpdated} securities.`);
+      refresh();
       refreshSecurities();
     } catch (err) {
       setSyncResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -88,16 +139,56 @@ export function MarketDataPage() {
     setEnriching(true);
     setEnrichResult(null);
     try {
-      const { data, error } = await supabase.functions.invoke('enrich-securities');
-      if (error) throw error;
-      if (data.message) {
-        setEnrichResult(data.message);
-      } else {
-        setEnrichResult(
-          `DSE enrichment: ${data.updated} updated, ${data.failed} failed, ${data.skipped} skipped (of ${data.total} total)`
-        );
+      // Load fundamentals + EOD from source
+      const { data: fundRows } = await marketDb.from('stock_fundamentals')
+        .select('symbol, market_cap, face_value, pe, sector, category');
+      const { data: dateRow } = await marketDb.from('daily_stock_eod')
+        .select('date').order('date', { ascending: false }).limit(1).single();
+      const { data: eodRows } = await marketDb.from('daily_stock_eod')
+        .select('symbol, category, sector, pe').eq('date', dateRow!.date);
+
+      const fundMap: Record<string, typeof fundRows extends (infer T)[] | null ? T : never> = {};
+      for (const f of fundRows ?? []) { if (f.symbol) fundMap[f.symbol.toUpperCase()] = f; }
+      const eodMap: Record<string, typeof eodRows extends (infer T)[] | null ? T : never> = {};
+      for (const e of eodRows ?? []) { if (e.symbol) eodMap[e.symbol.toUpperCase()] = e; }
+
+      // Load local securities
+      const { data: localSecs } = await supabase.from('securities')
+        .select('isin, security_code, category, board, sector, trailing_pe, free_float_market_cap, face_value');
+
+      let updated = 0, skipped = 0, noMatch = 0;
+      const BATCH = 50;
+      const pending: Array<{ isin: string; updates: Record<string, unknown> }> = [];
+
+      for (const sec of localSecs ?? []) {
+        const code = (sec.security_code || '').toUpperCase();
+        const fund = fundMap[code];
+        const eod = eodMap[code];
+        if (!fund && !eod) { noMatch++; continue; }
+
+        const updates: Record<string, unknown> = {};
+        const newCat = fund?.category || eod?.category || null;
+        if (newCat && !sec.category) updates.category = newCat;
+        const newSector = fund?.sector || eod?.sector || null;
+        if (newSector && !sec.sector) updates.sector = newSector;
+        const newPE = fund?.pe || eod?.pe || null;
+        if (newPE && newPE > 0 && sec.trailing_pe == null) updates.trailing_pe = newPE;
+        if (fund?.face_value != null && sec.face_value == null) updates.face_value = fund.face_value;
+        if (fund?.market_cap != null && sec.free_float_market_cap == null) updates.free_float_market_cap = fund.market_cap;
+        const effectiveCat = (updates.category || sec.category) as string | null;
+        if (!sec.board && effectiveCat && ['A', 'B', 'Z', 'N'].includes(effectiveCat)) updates.board = 'PUBLIC';
+
+        if (Object.keys(updates).length === 0) { skipped++; continue; }
+        pending.push({ isin: sec.isin, updates });
       }
-      // Refresh local securities to show updated info
+
+      for (let i = 0; i < pending.length; i += BATCH) {
+        const batch = pending.slice(i, i + BATCH);
+        await Promise.all(batch.map(p => supabase.from('securities').update(p.updates).eq('isin', p.isin)));
+        updated += batch.length;
+      }
+
+      setEnrichResult(`Enriched ${updated} securities from source DB. Skipped: ${skipped}, No match: ${noMatch}.`);
       refreshSecurities();
     } catch (err) {
       setEnrichResult(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -110,11 +201,83 @@ export function MarketDataPage() {
     setClassifying(true);
     setClassifyResult(null);
     try {
-      const { data, error } = await supabase.functions.invoke('classify-marginability');
-      if (error) throw error;
-      setClassifyResult(
-        `Classification complete: ${data.marginable_count} marginable, ${data.non_marginable_count} non-marginable (of ${data.total_securities} total)`
-      );
+      // Load margin config
+      const { data: configRows } = await supabase.from('margin_config').select('key, value');
+      const cfg: Record<string, number> = {};
+      for (const r of configRows ?? []) cfg[r.key] = r.value;
+      const minFFMC = cfg.min_ffmc_mn ?? 500;
+      const maxPE = cfg.max_trailing_pe ?? 30;
+      const peMult = cfg.sectoral_pe_multiplier ?? 2;
+
+      // Load securities
+      const { data: secs } = await supabase.from('securities')
+        .select('isin, security_code, category, board, sector, trailing_pe, free_float_market_cap, annual_dividend_pct, status, asset_class');
+      if (!secs) throw new Error('Failed to load securities');
+
+      // Sectoral median P/E
+      const sectorPEs: Record<string, number[]> = {};
+      for (const s of secs) {
+        if (s.sector && s.trailing_pe > 0) {
+          if (!sectorPEs[s.sector]) sectorPEs[s.sector] = [];
+          sectorPEs[s.sector].push(s.trailing_pe);
+        }
+      }
+      const medians: Record<string, number> = {};
+      for (const [sector, vals] of Object.entries(sectorPEs)) {
+        const sorted = [...vals].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        medians[sector] = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+      }
+
+      type SecRow = NonNullable<typeof secs>[0];
+      function classify(s: SecRow): { is_marginable: boolean; reason: string } {
+        if (!s.category || ['N', 'Z', 'G', 'S'].includes(s.category))
+          return { is_marginable: false, reason: `Category '${s.category ?? 'NULL'}' is not marginable` };
+        if (s.status === 'suspended')
+          return { is_marginable: false, reason: 'Security is suspended' };
+        if (!s.board || s.board !== 'PUBLIC')
+          return { is_marginable: false, reason: `Board '${s.board ?? 'NULL'}' — only Main Board (PUBLIC) is marginable` };
+        if (s.asset_class === 'MF')
+          return { is_marginable: false, reason: 'Mutual fund securities are not marginable' };
+        if (!['A', 'B'].includes(s.category))
+          return { is_marginable: false, reason: `Category '${s.category}' — only A and B are marginable` };
+        if (s.category === 'B' && (s.annual_dividend_pct == null || s.annual_dividend_pct < 5))
+          return { is_marginable: false, reason: `B-category requires >= 5% annual dividend (current: ${s.annual_dividend_pct ?? 'not set'})` };
+        if (s.trailing_pe == null || s.trailing_pe <= 0)
+          return { is_marginable: false, reason: `Negative or missing EPS (P/E: ${s.trailing_pe ?? 'NULL'})` };
+        if (s.trailing_pe > maxPE)
+          return { is_marginable: false, reason: `Trailing P/E (${s.trailing_pe}) exceeds max (${maxPE})` };
+        if (s.sector && medians[s.sector]) {
+          const limit = peMult * medians[s.sector];
+          if (s.trailing_pe > limit)
+            return { is_marginable: false, reason: `P/E (${s.trailing_pe}) exceeds ${peMult}x sectoral median (${medians[s.sector].toFixed(1)})` };
+        }
+        if (s.free_float_market_cap == null || s.free_float_market_cap < minFFMC)
+          return { is_marginable: false, reason: `Free float market cap (${s.free_float_market_cap ?? 'NULL'} mn) below ${minFFMC} mn` };
+        return { is_marginable: true, reason: 'Meets all BSEC marginability criteria' };
+      }
+
+      const now = new Date().toISOString();
+      let marginable = 0;
+      const updates = secs.map(s => {
+        const r = classify(s);
+        if (r.is_marginable) marginable++;
+        return { isin: s.isin, ...r };
+      });
+
+      const BATCH = 50;
+      for (let i = 0; i < updates.length; i += BATCH) {
+        const batch = updates.slice(i, i + BATCH);
+        await Promise.all(batch.map(u =>
+          supabase.from('securities').update({
+            is_marginable: u.is_marginable,
+            marginability_reason: u.reason,
+            marginability_updated_at: now,
+          }).eq('isin', u.isin)
+        ));
+      }
+
+      setClassifyResult(`Classification complete: ${marginable} marginable, ${secs.length - marginable} non-marginable (of ${secs.length} total)`);
       refreshSecurities();
     } catch (err) {
       setClassifyResult(`Error: ${err instanceof Error ? err.message : String(err)}`);

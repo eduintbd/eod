@@ -13,6 +13,7 @@ import { AlertsPage } from '@/pages/AlertsPage';
 import { SettingsPage } from '@/pages/SettingsPage';
 import { EodSnapshotsPage } from '@/pages/EodSnapshotsPage';
 import { UnsettledIssuesPage } from '@/pages/UnsettledIssuesPage';
+import { LearningCenterPage } from '@/pages/LearningCenterPage';
 
 function ProtectedRoutes() {
   const { user, loading } = useAuth();
@@ -53,6 +54,7 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<AuthGate />} />
+        <Route path="/learn" element={<LearningCenterPage />} />
         <Route path="/*" element={<ProtectedRoutes />} />
       </Routes>
     </BrowserRouter>
