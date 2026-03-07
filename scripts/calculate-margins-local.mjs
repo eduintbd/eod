@@ -64,13 +64,12 @@ for (const l of allLedger || []) {
 }
 console.log(`Loaded cash balances for ${Object.keys(cashByClient).length} clients`);
 
-// Load Margin clients
+// Load ALL clients (Margin + Cash) — negative equity can occur in any account type
 let allClients = [];
 let offset = 0;
 while (true) {
   const { data: batch } = await supabase.from('clients')
-    .select('client_id, client_code')
-    .eq('account_type', 'Margin')
+    .select('client_id, client_code, account_type')
     .order('client_id')
     .range(offset, offset + 999);
   if (!batch || batch.length === 0) break;
@@ -78,7 +77,9 @@ while (true) {
   offset += batch.length;
   if (batch.length < 1000) break;
 }
-console.log(`\nProcessing ${allClients.length} Margin clients...`);
+const marginCount = allClients.filter(c => c.account_type === 'Margin').length;
+const cashCount = allClients.length - marginCount;
+console.log(`\nProcessing ${allClients.length} clients (${marginCount} Margin, ${cashCount} Cash/Other)...`);
 
 // Load existing margin_accounts
 const { data: existingMargins } = await supabase.from('margin_accounts')
