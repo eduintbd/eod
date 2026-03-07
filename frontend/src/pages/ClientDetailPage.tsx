@@ -16,7 +16,16 @@ export function ClientDetailPage() {
   const [cashEntries, setCashEntries] = useState<CashLedgerEntry[]>([]);
   const [trades, setTrades] = useState<TradeExecution[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'holdings' | 'cash' | 'trades' | 'margin'>('holdings');
+  const [tab, setTab] = useState<'summary' | 'holdings' | 'cash' | 'trades' | 'margin'>('summary');
+
+  // Summary tab state
+  const [summaryFrom, setSummaryFrom] = useState('');
+  const [summaryTo, setSummaryTo] = useState('');
+  const [summaryTrades, setSummaryTrades] = useState<TradeExecution[]>([]);
+  const [openingBalance, setOpeningBalance] = useState(0);
+  const [totalDeposit, setTotalDeposit] = useState(0);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [securitiesMap, setSecuritiesMap] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!clientId) return;
@@ -53,6 +62,86 @@ export function ClientDetailPage() {
     load();
   }, [clientId]);
 
+  // Initialize summary date range from latest trade date, or latest cash entry, or today
+  useEffect(() => {
+    if (summaryFrom) return;
+    if (trades.length > 0) {
+      setSummaryFrom(trades[0].trade_date);
+      setSummaryTo(trades[0].trade_date);
+    } else if (cashEntries.length > 0) {
+      setSummaryFrom(cashEntries[0].transaction_date);
+      setSummaryTo(cashEntries[0].transaction_date);
+    } else if (!loading) {
+      const today = new Date().toISOString().slice(0, 10);
+      setSummaryFrom(today);
+      setSummaryTo(today);
+    }
+  }, [trades, cashEntries, loading, summaryFrom]);
+
+  // Load summary data when dates change
+  useEffect(() => {
+    if (!clientId || !summaryFrom || !summaryTo) return;
+
+    async function loadSummary() {
+      setSummaryLoading(true);
+      const [balanceRes, balanceFallbackRes, tradesRes, depositRes, secRes] = await Promise.all([
+        // Opening balance: last cash_ledger entry before from_date
+        supabase
+          .from('cash_ledger')
+          .select('running_balance')
+          .eq('client_id', clientId!)
+          .lt('transaction_date', summaryFrom)
+          .order('id', { ascending: false })
+          .limit(1),
+        // Fallback: last non-trade entry on or before from_date (for clients with no prior entries)
+        supabase
+          .from('cash_ledger')
+          .select('running_balance')
+          .eq('client_id', clientId!)
+          .lte('transaction_date', summaryFrom)
+          .not('type', 'in', '("BUY_TRADE","SELL_TRADE","COMMISSION","TAX")')
+          .order('id', { ascending: false })
+          .limit(1),
+        // Trades in date range
+        supabase
+          .from('trade_executions')
+          .select('*')
+          .eq('client_id', clientId!)
+          .gte('trade_date', summaryFrom)
+          .lte('trade_date', summaryTo)
+          .order('trade_date')
+          .order('exec_id'),
+        // Total deposits (all time)
+        supabase
+          .from('cash_ledger')
+          .select('amount')
+          .eq('client_id', clientId!)
+          .eq('type', 'DEPOSIT'),
+        // Securities lookup for codes
+        supabase
+          .from('securities')
+          .select('isin, security_code'),
+      ]);
+
+      setOpeningBalance(
+        balanceRes.data?.[0]?.running_balance
+        ?? balanceFallbackRes.data?.[0]?.running_balance
+        ?? 0
+      );
+      setSummaryTrades((tradesRes.data ?? []) as TradeExecution[]);
+      setTotalDeposit(depositRes.data?.reduce((sum: number, d: { amount: number }) => sum + d.amount, 0) ?? 0);
+
+      // Build isin → security_code map
+      const map: Record<string, string> = {};
+      for (const s of secRes.data ?? []) {
+        if (s.security_code) map[s.isin] = s.security_code;
+      }
+      setSecuritiesMap(map);
+      setSummaryLoading(false);
+    }
+    loadSummary();
+  }, [clientId, summaryFrom, summaryTo]);
+
   // Extract security codes from holdings to fetch live prices
   const symbols = useMemo(
     () => holdings
@@ -68,6 +157,17 @@ export function ClientDetailPage() {
   const { alerts: clientAlerts } = useMarginAlerts({ resolved: null, page: 0 });
   const filteredAlerts = clientAlerts.filter(a => a.client_id === clientId);
   const { snapshots: clientSnapshots } = useClientSnapshots(clientId, 10);
+
+  // Compute summary running balances (must be before early returns — Rules of Hooks)
+  const summaryRows = useMemo(() => {
+    let balance = openingBalance;
+    return summaryTrades.map(t => {
+      const debit = t.side === 'BUY' ? t.net_value : 0;
+      const credit = t.side === 'SELL' ? t.net_value : 0;
+      balance = balance - debit + credit;
+      return { ...t, debit, credit, balance };
+    });
+  }, [summaryTrades, openingBalance]);
 
   if (loading) return <div className="text-muted-foreground">Loading...</div>;
   if (!client) return <div className="text-destructive">Client not found</div>;
@@ -89,7 +189,27 @@ export function ClientDetailPage() {
   const cashBalance = cashEntries.length > 0 ? cashEntries[0].running_balance : 0;
   const netEquity = totalMarketValue + cashBalance;
 
+  // Helper: get security code from isin
+  function getSecCode(isin: string): string {
+    if (securitiesMap[isin]) return securitiesMap[isin];
+    if (isin.startsWith('DSE-')) return isin.slice(4);
+    if (isin.startsWith('PLACEHOLDER-')) return isin.slice(12);
+    return isin;
+  }
+
+  // Helper: format date as dd-Mon-yyyy
+  function fmtDate(dateStr: string): string {
+    const d = new Date(dateStr + 'T00:00:00');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${String(d.getDate()).padStart(2, '0')}-${months[d.getMonth()]}-${d.getFullYear()}`;
+  }
+
+  const totalDebit = summaryRows.reduce((s, r) => s + r.debit, 0);
+  const totalCredit = summaryRows.reduce((s, r) => s + r.credit, 0);
+  const closingBalance = openingBalance - totalDebit + totalCredit;
+
   const tabs = [
+    { key: 'summary' as const, label: 'Summary' },
     { key: 'holdings' as const, label: `Holdings (${holdings.length})` },
     { key: 'cash' as const, label: 'Cash Ledger' },
     { key: 'trades' as const, label: 'Trade History' },
@@ -172,6 +292,139 @@ export function ClientDetailPage() {
 
       {/* Tab Content */}
       <div className="bg-card rounded-lg border border-border overflow-hidden">
+        {tab === 'summary' && (
+          <div className="p-6 space-y-6">
+            {/* Company Header */}
+            <div className="flex justify-between items-start border-b border-border pb-4">
+              <div>
+                <h2 className="text-xl font-bold">UCB Stock Brokerage Limited.</h2>
+                <p className="text-sm font-semibold">TREC Holder: DSE #181 | CSE#015</p>
+                <p className="text-xs text-muted-foreground">"BULUS CENTER" (17th floor, west side), Plot-CWS(A)1, Road No-34, Gulshan Avenue</p>
+              </div>
+              <div className="text-right text-xs text-muted-foreground space-y-0.5">
+                <p>Phone : (+88) 09678-175175</p>
+                <p>Email : info@ucbstock.com.bd</p>
+                <p>Web : www.ucbstock.com.bd</p>
+              </div>
+            </div>
+
+            {/* Title */}
+            <h3 className="text-center text-base font-bold underline">Investor Ledger Statement Summary</h3>
+
+            {/* Date Range Picker */}
+            <div className="flex items-center gap-4 text-sm">
+              <label className="font-semibold">From</label>
+              <input
+                type="date"
+                value={summaryFrom}
+                onChange={e => setSummaryFrom(e.target.value)}
+                className="border border-border rounded px-2 py-1 bg-background text-foreground text-sm"
+              />
+              <label className="font-semibold">To</label>
+              <input
+                type="date"
+                value={summaryTo}
+                onChange={e => setSummaryTo(e.target.value)}
+                className="border border-border rounded px-2 py-1 bg-background text-foreground text-sm"
+              />
+            </div>
+
+            {/* Account Info Grid */}
+            <div className="grid grid-cols-3 gap-x-8 gap-y-1 text-sm">
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[120px]">Account No</span>
+                <span>: {client.client_code}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[130px]">Account Type</span>
+                <span>: {client.category === 'institution' ? 'Institutional Account' : client.category === 'foreign' ? 'Foreign Account' : 'Individual Account'}</span>
+              </div>
+              <div className="text-right">
+                <span className="font-semibold">Receivable Amount : </span>
+                <span>{formatNumber(0)}</span>
+              </div>
+
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[120px]">BOID</span>
+                <span>: {client.bo_id}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[130px]">Account Status</span>
+                <span>: {client.status === 'active' ? 'Active' : client.status === 'suspended' ? 'Suspended' : client.status === 'closed' ? 'Closed' : 'Pending Review'}</span>
+              </div>
+              <div className="text-right">
+                <span className="font-semibold">Total Deposit : </span>
+                <span>{formatNumber(totalDeposit)}</span>
+              </div>
+
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[120px]">Account Name</span>
+                <span>: {client.name}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="font-semibold min-w-[130px]">Account Category</span>
+                <span>: {client.account_type === 'Margin' ? 'Margin' : 'Non Margin'}</span>
+              </div>
+              <div className="text-right">
+                <span className="font-bold">Opening Balance : </span>
+                <span className="font-bold">{formatNumber(openingBalance)}</span>
+              </div>
+            </div>
+
+            {/* Trades Table */}
+            {summaryLoading ? (
+              <p className="text-sm text-muted-foreground">Loading summary...</p>
+            ) : (
+              <table className="w-full text-sm border-collapse">
+                <thead>
+                  <tr className="border-y-2 border-foreground text-left bg-muted/50 font-bold">
+                    <th className="p-2">Date</th>
+                    <th className="p-2">Operation</th>
+                    <th className="p-2">Details</th>
+                    <th className="p-2 text-right">Quantity</th>
+                    <th className="p-2 text-right">Rate</th>
+                    <th className="p-2 text-right">Debit</th>
+                    <th className="p-2 text-right">Credit</th>
+                    <th className="p-2 text-right">Balance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {summaryRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="p-4 text-center text-muted-foreground">
+                        No trades found for the selected date range.
+                      </td>
+                    </tr>
+                  ) : (
+                    summaryRows.map(r => (
+                      <tr key={r.exec_id} className="border-b border-border">
+                        <td className="p-2">{fmtDate(r.trade_date)}</td>
+                        <td className="p-2">{r.side === 'BUY' ? 'BUY' : 'SELL'}</td>
+                        <td className="p-2">{r.side === 'BUY' ? 'Bought' : 'Sold'} {getSecCode(r.isin)}</td>
+                        <td className="p-2 text-right">{formatNumber(r.quantity, 0)}</td>
+                        <td className="p-2 text-right">{formatNumber(r.price, 4)}</td>
+                        <td className="p-2 text-right">{formatNumber(r.debit)}</td>
+                        <td className="p-2 text-right">{formatNumber(r.credit)}</td>
+                        <td className="p-2 text-right">{formatNumber(r.balance)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+                {summaryRows.length > 0 && (
+                  <tfoot>
+                    <tr className="border-t-2 border-foreground font-bold">
+                      <td className="p-2" colSpan={5} style={{ textAlign: 'right' }}>Closing Balance :</td>
+                      <td className="p-2 text-right">{formatNumber(totalDebit)}</td>
+                      <td className="p-2 text-right">{formatNumber(totalCredit)}</td>
+                      <td className="p-2 text-right">{formatNumber(closingBalance)}</td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            )}
+          </div>
+        )}
+
         {tab === 'holdings' && (
           holdings.length === 0 ? (
             <p className="p-4 text-sm text-muted-foreground">No holdings.</p>
