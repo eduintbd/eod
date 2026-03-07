@@ -46,13 +46,13 @@ function useLocalSecurities() {
 }
 
 export function MarketDataPage() {
-  const { prices, latestDate, loading, error, refresh } = useAllLatestPrices();
+  const [syncDate, setSyncDate] = useState('');
+  const { prices, latestDate, loading, error, refresh } = useAllLatestPrices(syncDate || undefined);
   const { fundamentals } = useFundamentals();
   const { securities: localSecurities, refresh: refreshSecurities } = useLocalSecurities();
   const [search, setSearch] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
-  const [syncDate, setSyncDate] = useState('');
   const [enriching, setEnriching] = useState(false);
   const [enrichResult, setEnrichResult] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);

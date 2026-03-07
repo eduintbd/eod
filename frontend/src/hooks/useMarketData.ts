@@ -69,10 +69,10 @@ export function useLatestPrices(symbols: string[]) {
 }
 
 /**
- * Fetch all latest prices from public.price_history (1.18M rows, OHLCV since 2012).
- * This is the canonical price source in ucb csm.
+ * Fetch prices from public.price_history for a given date (or latest if not specified).
+ * Pass a date string (YYYY-MM-DD) to view a specific date's prices.
  */
-export function useAllLatestPrices() {
+export function useAllLatestPrices(targetDate?: string) {
   const [prices, setPrices] = useState<DailyStockEod[]>([]);
   const [latestDate, setLatestDate] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -83,16 +83,19 @@ export function useAllLatestPrices() {
     setError(null);
 
     try {
-      // Find the latest date in public.price_history
-      const { data: dateRow, error: dateErr } = await marketPublicDb
-        .from('price_history')
-        .select('trade_date')
-        .order('trade_date', { ascending: false })
-        .limit(1)
-        .single();
+      let date = targetDate;
+      if (!date) {
+        // Find the latest date in public.price_history
+        const { data: dateRow, error: dateErr } = await marketPublicDb
+          .from('price_history')
+          .select('trade_date')
+          .order('trade_date', { ascending: false })
+          .limit(1)
+          .single();
 
-      if (dateErr) throw new Error(dateErr.message);
-      const date = dateRow.trade_date as string;
+        if (dateErr) throw new Error(dateErr.message);
+        date = dateRow.trade_date as string;
+      }
       setLatestDate(date);
 
       // Fetch all prices for that date
@@ -108,7 +111,7 @@ export function useAllLatestPrices() {
       const mapped: DailyStockEod[] = (phData ?? []).map(row => ({
         id: String(row.id ?? row.symbol),
         symbol: row.symbol ?? '',
-        date: row.trade_date ?? date,
+        date: row.trade_date ?? date!,
         close: row.close ?? 0,
         volume: row.volume ?? 0,
         total_shares: null,
@@ -124,7 +127,7 @@ export function useAllLatestPrices() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [targetDate]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
