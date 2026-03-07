@@ -543,12 +543,12 @@ export function useImport() {
     if (finalStatus === 'SUCCESS' || finalStatus === 'PARTIAL') {
       await supabase
         .from('import_state')
-        .update({
+        .upsert({
+          id: 1,
           baseline_date: dateStr,
           last_processed_date: dateStr,
           baseline_import_audit_id: auditId,
-        })
-        .eq('id', 1);
+        }, { onConflict: 'id' });
     }
 
     // ── Final: Update audit record ──
