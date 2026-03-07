@@ -45,24 +45,44 @@ for (const s of securities || []) {
 }
 console.log(`${marginableSet.size} marginable securities`);
 
-// Load ALL holdings with qty > 0
-const { data: allHoldings } = await supabase.from('holdings')
-  .select('client_id, isin, quantity, average_cost').gt('quantity', 0);
+// Load ALL holdings with qty > 0 (paginated — Supabase default limit is 1000)
 const holdingsByClient = {};
-for (const h of allHoldings || []) {
-  if (!holdingsByClient[h.client_id]) holdingsByClient[h.client_id] = [];
-  holdingsByClient[h.client_id].push(h);
+let hOffset = 0;
+let hTotal = 0;
+while (true) {
+  const { data: batch } = await supabase.from('holdings')
+    .select('client_id, isin, quantity, average_cost')
+    .gt('quantity', 0)
+    .range(hOffset, hOffset + 999);
+  if (!batch || batch.length === 0) break;
+  for (const h of batch) {
+    if (!holdingsByClient[h.client_id]) holdingsByClient[h.client_id] = [];
+    holdingsByClient[h.client_id].push(h);
+  }
+  hTotal += batch.length;
+  hOffset += batch.length;
+  if (batch.length < 1000) break;
 }
-console.log(`Loaded ${allHoldings?.length} holdings for ${Object.keys(holdingsByClient).length} clients`);
+console.log(`Loaded ${hTotal} holdings for ${Object.keys(holdingsByClient).length} clients`);
 
-// Load ALL cash_ledger (latest per client)
-const { data: allLedger } = await supabase.from('cash_ledger')
-  .select('client_id, running_balance').order('id', { ascending: false });
+// Load ALL cash_ledger (latest per client, paginated)
 const cashByClient = {};
-for (const l of allLedger || []) {
-  if (!cashByClient[l.client_id]) cashByClient[l.client_id] = Number(l.running_balance);
+let cOffset = 0;
+let cTotal = 0;
+while (true) {
+  const { data: batch } = await supabase.from('cash_ledger')
+    .select('client_id, running_balance')
+    .order('id', { ascending: false })
+    .range(cOffset, cOffset + 999);
+  if (!batch || batch.length === 0) break;
+  for (const l of batch) {
+    if (!cashByClient[l.client_id]) cashByClient[l.client_id] = Number(l.running_balance);
+  }
+  cTotal += batch.length;
+  cOffset += batch.length;
+  if (batch.length < 1000) break;
 }
-console.log(`Loaded cash balances for ${Object.keys(cashByClient).length} clients`);
+console.log(`Loaded ${cTotal} cash entries for ${Object.keys(cashByClient).length} clients`);
 
 // Load ALL clients (Margin + Cash) — negative equity can occur in any account type
 let allClients = [];
