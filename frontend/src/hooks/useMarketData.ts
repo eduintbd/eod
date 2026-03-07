@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { marketDb } from '@/lib/supabase-market';
+import { marketDb, marketPublicDb } from '@/lib/supabase-market';
 import type { DailyStockEod, StockFundamental, HistoricalPrice } from '@/lib/types';
 
 /**
- * Fetch the latest EOD prices for a list of symbols.
+ * Fetch the latest prices for a list of symbols from public.price_history.
  * Returns the most recent date's data for each symbol.
  */
 export function useLatestPrices(symbols: string[]) {
@@ -23,22 +23,32 @@ export function useLatestPrices(symbols: string[]) {
 
     (async () => {
       try {
-        // Fetch latest price for each symbol (most recent date)
-        const { data, error: fetchErr } = await marketDb
-          .from('daily_stock_eod')
-          .select('*')
+        const { data, error: fetchErr } = await marketPublicDb
+          .from('price_history')
+          .select('id, symbol, trade_date, close, volume')
           .in('symbol', symbols)
-          .order('date', { ascending: false })
-          .limit(symbols.length * 2); // buffer for multiple dates
+          .order('trade_date', { ascending: false })
+          .limit(symbols.length * 2);
 
         if (fetchErr) throw new Error(fetchErr.message);
         if (cancelled) return;
 
-        // Group by symbol, keep only the most recent entry
         const bySymbol: Record<string, DailyStockEod> = {};
-        for (const row of (data ?? []) as DailyStockEod[]) {
-          if (!bySymbol[row.symbol]) {
-            bySymbol[row.symbol] = row;
+        for (const row of data ?? []) {
+          const sym = row.symbol ?? '';
+          if (!bySymbol[sym]) {
+            bySymbol[sym] = {
+              id: String(row.id ?? sym),
+              symbol: sym,
+              date: row.trade_date ?? '',
+              close: row.close ?? 0,
+              volume: row.volume ?? 0,
+              total_shares: null,
+              category: null,
+              sector: null,
+              pe: null,
+              created_at: '',
+            };
           }
         }
 
@@ -59,7 +69,8 @@ export function useLatestPrices(symbols: string[]) {
 }
 
 /**
- * Fetch all latest EOD prices (for the most recent trading date).
+ * Fetch all latest prices from public.price_history (1.18M rows, OHLCV since 2012).
+ * This is the canonical price source in ucb csm.
  */
 export function useAllLatestPrices() {
   const [prices, setPrices] = useState<DailyStockEod[]>([]);
@@ -72,27 +83,42 @@ export function useAllLatestPrices() {
     setError(null);
 
     try {
-      // First, find the latest date
-      const { data: dateRow, error: dateErr } = await marketDb
-        .from('daily_stock_eod')
-        .select('date')
-        .order('date', { ascending: false })
+      // Find the latest date in public.price_history
+      const { data: dateRow, error: dateErr } = await marketPublicDb
+        .from('price_history')
+        .select('trade_date')
+        .order('trade_date', { ascending: false })
         .limit(1)
         .single();
 
       if (dateErr) throw new Error(dateErr.message);
-      const date = (dateRow as DailyStockEod).date;
+      const date = dateRow.trade_date as string;
       setLatestDate(date);
 
-      // Then fetch all prices for that date
-      const { data, error: fetchErr } = await marketDb
-        .from('daily_stock_eod')
-        .select('*')
-        .eq('date', date)
+      // Fetch all prices for that date
+      const { data: phData, error: phErr } = await marketPublicDb
+        .from('price_history')
+        .select('id, symbol, trade_date, open, high, low, close, volume')
+        .eq('trade_date', date)
         .order('symbol');
 
-      if (fetchErr) throw new Error(fetchErr.message);
-      setPrices((data ?? []) as DailyStockEod[]);
+      if (phErr) throw new Error(phErr.message);
+
+      // Map to DailyStockEod shape for backward compat with MarketDataPage
+      const mapped: DailyStockEod[] = (phData ?? []).map(row => ({
+        id: String(row.id ?? row.symbol),
+        symbol: row.symbol ?? '',
+        date: row.trade_date ?? date,
+        close: row.close ?? 0,
+        volume: row.volume ?? 0,
+        total_shares: null,
+        category: null,
+        sector: null,
+        pe: null,
+        created_at: '',
+      }));
+
+      setPrices(mapped);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -154,7 +180,7 @@ export function useFundamentals(symbols?: string[]) {
 }
 
 /**
- * Fetch historical prices for a single symbol.
+ * Fetch historical prices for a single symbol from public.price_history.
  */
 export function useHistoricalPrices(symbol: string | null, days = 365) {
   const [history, setHistory] = useState<HistoricalPrice[]>([]);
@@ -173,17 +199,31 @@ export function useHistoricalPrices(symbol: string | null, days = 365) {
 
     (async () => {
       try {
-        const { data, error: fetchErr } = await marketDb
-          .from('historical_prices')
-          .select('*')
+        const { data, error: fetchErr } = await marketPublicDb
+          .from('price_history')
+          .select('id, symbol, trade_date, open, high, low, close, volume')
           .eq('symbol', symbol)
-          .order('date', { ascending: true })
+          .order('trade_date', { ascending: true })
           .limit(days);
 
         if (fetchErr) throw new Error(fetchErr.message);
         if (cancelled) return;
 
-        setHistory((data ?? []) as HistoricalPrice[]);
+        // Map trade_date → date for HistoricalPrice compat
+        const mapped: HistoricalPrice[] = (data ?? []).map(row => ({
+          id: String(row.id),
+          symbol: row.symbol,
+          date: row.trade_date,
+          open: row.open,
+          high: row.high,
+          low: row.low,
+          close: row.close,
+          volume: row.volume,
+          created_at: null,
+          updated_at: null,
+        }));
+
+        setHistory(mapped);
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : String(err));
@@ -201,23 +241,35 @@ export function useHistoricalPrices(symbol: string | null, days = 365) {
 
 /**
  * One-shot function to fetch the current price for a single symbol.
- * Useful in components that don't need reactive updates.
+ * Uses public.price_history (canonical price source).
  */
 export async function fetchCurrentPrice(symbol: string): Promise<DailyStockEod | null> {
-  const { data, error } = await marketDb
-    .from('daily_stock_eod')
-    .select('*')
+  const { data, error } = await marketPublicDb
+    .from('price_history')
+    .select('id, symbol, trade_date, close, volume')
     .eq('symbol', symbol)
-    .order('date', { ascending: false })
+    .order('trade_date', { ascending: false })
     .limit(1)
     .single();
 
-  if (error) return null;
-  return data as DailyStockEod;
+  if (error || !data) return null;
+  return {
+    id: String(data.id ?? data.symbol),
+    symbol: data.symbol ?? symbol,
+    date: data.trade_date ?? '',
+    close: data.close ?? 0,
+    volume: data.volume ?? 0,
+    total_shares: null,
+    category: null,
+    sector: null,
+    pe: null,
+    created_at: '',
+  };
 }
 
 /**
  * One-shot function to fetch prices for multiple symbols.
+ * Uses public.price_history (canonical price source).
  */
 export async function fetchPricesForSymbols(
   symbols: string[],
@@ -225,26 +277,37 @@ export async function fetchPricesForSymbols(
   if (symbols.length === 0) return {};
 
   // Get the latest date first
-  const { data: dateRow } = await marketDb
-    .from('daily_stock_eod')
-    .select('date')
-    .order('date', { ascending: false })
+  const { data: dateRow } = await marketPublicDb
+    .from('price_history')
+    .select('trade_date')
+    .order('trade_date', { ascending: false })
     .limit(1)
     .single();
 
   if (!dateRow) return {};
 
-  const { data, error } = await marketDb
-    .from('daily_stock_eod')
-    .select('*')
+  const { data, error } = await marketPublicDb
+    .from('price_history')
+    .select('id, symbol, trade_date, close, volume')
     .in('symbol', symbols)
-    .eq('date', (dateRow as DailyStockEod).date);
+    .eq('trade_date', dateRow.trade_date as string);
 
   if (error || !data) return {};
 
   const result: Record<string, DailyStockEod> = {};
-  for (const row of data as DailyStockEod[]) {
-    result[row.symbol] = row;
+  for (const row of data) {
+    result[row.symbol ?? ''] = {
+      id: String(row.id ?? row.symbol ?? ''),
+      symbol: row.symbol ?? '',
+      date: row.trade_date ?? '',
+      close: row.close ?? 0,
+      volume: row.volume ?? 0,
+      total_shares: null,
+      category: null,
+      sector: null,
+      pe: null,
+      created_at: '',
+    };
   }
   return result;
 }

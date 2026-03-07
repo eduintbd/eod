@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { RefreshCw, TrendingUp, Search, Database, ShieldCheck } from 'lucide-react';
 import { useAllLatestPrices, useFundamentals } from '@/hooks/useMarketData';
-import { marketDb } from '@/lib/supabase-market';
+import { marketDb, marketPublicDb } from '@/lib/supabase-market';
 import { formatNumber, formatBDT } from '@/lib/utils';
 import { supabase, supabaseAdmin } from '@/lib/supabase';
 
@@ -53,19 +53,10 @@ export function MarketDataPage() {
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [syncDate, setSyncDate] = useState('');
-  const [availableDates, setAvailableDates] = useState<string[]>([]);
   const [enriching, setEnriching] = useState(false);
   const [enrichResult, setEnrichResult] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);
   const [classifyResult, setClassifyResult] = useState<string | null>(null);
-
-  // Load available dates from source
-  useEffect(() => {
-    marketDb.from('daily_stock_eod').select('date').order('date', { ascending: false }).then(({ data }) => {
-      const unique = [...new Set((data ?? []).map(d => d.date as string))].sort().reverse();
-      setAvailableDates(unique);
-    });
-  }, []);
 
   const filtered = useMemo(() => {
     if (!search) return prices;
@@ -81,25 +72,26 @@ export function MarketDataPage() {
     setSyncing(true);
     setSyncResult(null);
     try {
-      // Use selected date or fetch latest
+      // Use selected date or fetch latest from public.price_history
       let targetDate = syncDate;
       if (!targetDate) {
-        const { data: dateRow, error: dateErr } = await marketDb
-          .from('daily_stock_eod')
-          .select('date')
-          .order('date', { ascending: false })
+        const { data: dateRow, error: dateErr } = await marketPublicDb
+          .from('price_history')
+          .select('trade_date')
+          .order('trade_date', { ascending: false })
           .limit(1)
           .single();
         if (dateErr) throw new Error(`Source date: ${dateErr.message}`);
-        targetDate = dateRow.date;
+        targetDate = dateRow.trade_date;
       }
 
-      // Fetch all EOD data for that date
-      const { data: eodData, error: eodErr } = await marketDb
-        .from('daily_stock_eod')
-        .select('symbol, date, close, volume')
-        .eq('date', targetDate);
-      if (eodErr) throw new Error(`EOD fetch: ${eodErr.message}`);
+      // Fetch OHLCV from public.price_history for that date
+      const { data: hpData, error: hpErr } = await marketPublicDb
+        .from('price_history')
+        .select('symbol, trade_date, open, high, low, close, volume')
+        .eq('trade_date', targetDate);
+      if (hpErr) throw new Error(`Price fetch: ${hpErr.message}`);
+      if (!hpData?.length) throw new Error(`No prices found for ${targetDate}`);
 
       // Map symbol → isin from local securities
       const { data: secs } = await supabase.from('securities').select('isin, security_code');
@@ -108,14 +100,17 @@ export function MarketDataPage() {
         if (s.security_code) codeToIsin[s.security_code.toUpperCase()] = s.isin;
       }
 
-      // Upsert into daily_prices
-      const priceRows = (eodData ?? [])
-        .filter(e => codeToIsin[e.symbol?.toUpperCase()])
-        .map(e => ({
-          isin: codeToIsin[e.symbol.toUpperCase()],
-          date: e.date,
-          close_price: e.close,
-          volume: e.volume,
+      // Upsert into daily_prices with full OHLCV
+      const priceRows = hpData
+        .filter(p => codeToIsin[p.symbol?.toUpperCase()])
+        .map(p => ({
+          isin: codeToIsin[p.symbol.toUpperCase()],
+          date: p.trade_date,
+          open_price: p.open,
+          high_price: p.high,
+          low_price: p.low,
+          close_price: p.close,
+          volume: p.volume,
           source: 'DSE',
         }));
 
@@ -127,19 +122,19 @@ export function MarketDataPage() {
         synced += batch.length;
       }
 
-      // Update last_close_price on securities (batch via parallel updates)
+      // Update last_close_price on securities
       let priceUpdated = 0;
       const BATCH = 50;
-      const eodMatched = (eodData ?? []).filter(e => codeToIsin[e.symbol?.toUpperCase()]);
-      for (let i = 0; i < eodMatched.length; i += BATCH) {
-        const batch = eodMatched.slice(i, i + BATCH);
-        await Promise.all(batch.map(e =>
-          supabaseAdmin.from('securities').update({ last_close_price: e.close }).eq('isin', codeToIsin[e.symbol.toUpperCase()])
+      const matched = hpData.filter(p => codeToIsin[p.symbol?.toUpperCase()]);
+      for (let i = 0; i < matched.length; i += BATCH) {
+        const batch = matched.slice(i, i + BATCH);
+        await Promise.all(batch.map(p =>
+          supabaseAdmin.from('securities').update({ last_close_price: p.close }).eq('isin', codeToIsin[p.symbol.toUpperCase()])
         ));
         priceUpdated += batch.length;
       }
 
-      setSyncResult(`Synced ${synced} prices for ${targetDate}, updated ${priceUpdated} securities.`);
+      setSyncResult(`Synced ${synced} prices (OHLCV) for ${targetDate}, updated ${priceUpdated} securities.`);
       refresh();
       refreshSecurities();
     } catch (err) {
@@ -153,18 +148,17 @@ export function MarketDataPage() {
     setEnriching(true);
     setEnrichResult(null);
     try {
-      // Load fundamentals + EOD from source
+      // Load fundamentals from dse_market_data schema
       const { data: fundRows } = await marketDb.from('stock_fundamentals')
         .select('symbol, market_cap, face_value, pe, sector, category');
-      const { data: dateRow } = await marketDb.from('daily_stock_eod')
-        .select('date').order('date', { ascending: false }).limit(1).single();
-      const { data: eodRows } = await marketDb.from('daily_stock_eod')
-        .select('symbol, category, sector, pe').eq('date', dateRow!.date);
+      // Load stocks from public schema (has category for ALL 417 stocks)
+      const { data: stockRows } = await marketPublicDb.from('stocks')
+        .select('symbol, category, sector');
 
       const fundMap: Record<string, typeof fundRows extends (infer T)[] | null ? T : never> = {};
       for (const f of fundRows ?? []) { if (f.symbol) fundMap[f.symbol.toUpperCase()] = f; }
-      const eodMap: Record<string, typeof eodRows extends (infer T)[] | null ? T : never> = {};
-      for (const e of eodRows ?? []) { if (e.symbol) eodMap[e.symbol.toUpperCase()] = e; }
+      const stockMap: Record<string, typeof stockRows extends (infer T)[] | null ? T : never> = {};
+      for (const s of stockRows ?? []) { if (s.symbol) stockMap[s.symbol.toUpperCase()] = s; }
 
       // Load local securities
       const { data: localSecs } = await supabase.from('securities')
@@ -177,15 +171,16 @@ export function MarketDataPage() {
       for (const sec of localSecs ?? []) {
         const code = (sec.security_code || '').toUpperCase();
         const fund = fundMap[code];
-        const eod = eodMap[code];
-        if (!fund && !eod) { noMatch++; continue; }
+        const stock = stockMap[code];
+        if (!fund && !stock) { noMatch++; continue; }
 
         const updates: Record<string, unknown> = {};
-        const newCat = fund?.category || eod?.category || null;
-        if (newCat && !sec.category) updates.category = newCat;
-        const newSector = fund?.sector || eod?.sector || null;
+        // Category: prefer stocks table (100% coverage), then fundamentals
+        const newCat = stock?.category || fund?.category || null;
+        if (newCat && newCat !== '-' && !sec.category) updates.category = newCat;
+        const newSector = stock?.sector || fund?.sector || null;
         if (newSector && !sec.sector) updates.sector = newSector;
-        const newPE = fund?.pe || eod?.pe || null;
+        const newPE = fund?.pe || null;
         if (newPE && newPE > 0 && sec.trailing_pe == null) updates.trailing_pe = newPE;
         if (fund?.face_value != null && sec.face_value == null) updates.face_value = fund.face_value;
         if (fund?.market_cap != null && sec.free_float_market_cap == null) updates.free_float_market_cap = fund.market_cap;
@@ -328,16 +323,13 @@ export function MarketDataPage() {
             <Database size={14} className={enriching ? 'animate-pulse' : ''} />
             {enriching ? 'Enriching...' : 'Enrich from DSE'}
           </button>
-          <select
+          <input
+            type="date"
             value={syncDate}
             onChange={e => setSyncDate(e.target.value)}
-            className="px-2 py-2 bg-card border border-border rounded-md text-sm"
-          >
-            <option value="">Latest date</option>
-            {availableDates.map(d => (
-              <option key={d} value={d}>{d}</option>
-            ))}
-          </select>
+            placeholder="Latest"
+            className="px-2 py-2 bg-card border border-border rounded-md text-sm w-36"
+          />
           <button
             onClick={handleSync}
             disabled={syncing}

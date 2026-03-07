@@ -26,3 +26,15 @@ export const marketDb = createClient(
     auth: { persistSession: false },
   }
 );
+
+/**
+ * Read-only client for the source project's public schema.
+ * Access to: stocks (category/sector), price_history (OHLCV since 2012)
+ */
+export const marketPublicDb = createClient(
+  marketDataUrl || 'http://localhost:54321',
+  marketDataAnonKey || 'placeholder',
+  {
+    auth: { persistSession: false },
+  }
+);
