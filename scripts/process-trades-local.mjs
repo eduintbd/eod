@@ -20,11 +20,13 @@ const fees = {
 };
 console.log('Fee schedule:', fees);
 
-function calcFees(value, side) {
-  const comm = value * fees.commission;
-  const exch = value * fees.exchange;
-  const cdbl = Math.max(value * fees.cdbl, fees.cdblMin);
-  const ait = value * fees.ait;
+function calcFees(value, side, clientCommRate) {
+  // Client-specific rate is all-inclusive (no separate exchange/CDBL/AIT)
+  const hasClientRate = clientCommRate != null;
+  const comm = value * (hasClientRate ? clientCommRate : fees.commission);
+  const exch = hasClientRate ? 0 : value * fees.exchange;
+  const cdbl = hasClientRate ? 0 : Math.max(value * fees.cdbl, fees.cdblMin);
+  const ait = hasClientRate ? 0 : value * fees.ait;
   const total = comm + exch + cdbl + ait;
   const net = side === 'BUY' ? value + total : value - total;
   return { commission: round(comm), exchange_fee: round(exch), cdbl_fee: round(cdbl), ait: round(ait), total_fees: round(total), net_value: round(net) };
@@ -45,13 +47,14 @@ function settlementDate(tradeDate, category, side, isSpot) {
 
 // ── Pre-load lookups ──
 console.log('Loading lookups...');
-const { data: clients } = await db.from('clients').select('client_id, bo_id, client_code');
-const boMap = {}, codeMap = {};
+const { data: clients } = await db.from('clients').select('client_id, bo_id, client_code, commission_rate');
+const boMap = {}, codeMap = {}, commRateMap = {};
 for (const c of clients || []) {
   if (c.bo_id) boMap[c.bo_id] = c.client_id;
   if (c.client_code) codeMap[c.client_code] = c.client_id;
+  if (c.commission_rate != null) commRateMap[c.client_id] = Number(c.commission_rate);
 }
-console.log(`  ${clients?.length} clients`);
+console.log(`  ${clients?.length} clients (${Object.keys(commRateMap).length} with custom commission rates)`);
 
 const { data: securities } = await db.from('securities').select('isin, security_code');
 const secByCode = {}, secByIsin = {};
@@ -65,21 +68,40 @@ const { data: existingExecs } = await db.from('trade_executions').select('exec_i
 const execSet = new Set((existingExecs || []).map(e => e.exec_id));
 console.log(`  ${execSet.size} existing executions`);
 
-// Load holdings and cash_ledger latest per client
-const { data: allHoldings } = await db.from('holdings').select('client_id, isin, quantity, average_cost, total_invested, realized_pl');
+// Load holdings (paginated — Supabase default limit is 1000)
 const holdingsMap = {};
-for (const h of allHoldings || []) {
-  const key = `${h.client_id}|${h.isin}`;
-  holdingsMap[key] = { ...h };
+let hOffset = 0, hTotal = 0;
+while (true) {
+  const { data: batch } = await db.from('holdings')
+    .select('client_id, isin, quantity, average_cost, total_invested, realized_pl')
+    .range(hOffset, hOffset + 999);
+  if (!batch || batch.length === 0) break;
+  for (const h of batch) {
+    holdingsMap[`${h.client_id}|${h.isin}`] = { ...h };
+  }
+  hTotal += batch.length;
+  hOffset += batch.length;
+  if (batch.length < 1000) break;
 }
-console.log(`  ${allHoldings?.length} holdings`);
+console.log(`  ${hTotal} holdings`);
 
-const { data: allLedger } = await db.from('cash_ledger').select('client_id, running_balance').order('id', { ascending: false });
+// Load cash_ledger latest per client (paginated)
 const cashMap = {};
-for (const l of allLedger || []) {
-  if (!cashMap[l.client_id]) cashMap[l.client_id] = Number(l.running_balance);
+let cOffset = 0, cTotal = 0;
+while (true) {
+  const { data: batch } = await db.from('cash_ledger')
+    .select('client_id, running_balance')
+    .order('id', { ascending: false })
+    .range(cOffset, cOffset + 999);
+  if (!batch || batch.length === 0) break;
+  for (const l of batch) {
+    if (!cashMap[l.client_id]) cashMap[l.client_id] = Number(l.running_balance);
+  }
+  cTotal += batch.length;
+  cOffset += batch.length;
+  if (batch.length < 1000) break;
 }
-console.log(`  ${Object.keys(cashMap).length} cash balances`);
+console.log(`  ${Object.keys(cashMap).length} cash balances (from ${cTotal} entries)`);
 
 // ── Load unprocessed trades ──
 let allTrades = [];
@@ -156,7 +178,7 @@ for (let i = 0; i < allTrades.length; i += BATCH) {
 
       const side = raw.side === 'B' ? 'BUY' : 'SELL';
       const tradeValue = Number(raw.value) || 0;
-      const f = calcFees(tradeValue, side);
+      const f = calcFees(tradeValue, side, commRateMap[clientId]);
       const settDate = raw.trade_date ? settlementDate(raw.trade_date, raw.category, side, raw.compulsory_spot) : null;
 
       execInserts.push({

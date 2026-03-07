@@ -19,11 +19,14 @@ export function calculateFees(
   tradeValue: number,
   side: 'BUY' | 'SELL',
   schedule: FeeSchedule,
+  clientCommissionRate?: number | null,
 ): FeeBreakdown {
-  const commission = tradeValue * schedule.commission_rate;
-  const exchange_fee = tradeValue * schedule.exchange_fee_rate;
-  const cdbl_fee = Math.max(tradeValue * schedule.cdbl_fee_rate, schedule.cdbl_min);
-  const ait = tradeValue * schedule.ait_rate;
+  // Client-specific rate is all-inclusive (no separate exchange/CDBL/AIT)
+  const hasClientRate = clientCommissionRate != null;
+  const commission = tradeValue * (clientCommissionRate ?? schedule.commission_rate);
+  const exchange_fee = hasClientRate ? 0 : tradeValue * schedule.exchange_fee_rate;
+  const cdbl_fee = hasClientRate ? 0 : Math.max(tradeValue * schedule.cdbl_fee_rate, schedule.cdbl_min);
+  const ait = hasClientRate ? 0 : tradeValue * schedule.ait_rate;
   const total_fees = commission + exchange_fee + cdbl_fee + ait;
 
   const net_value = side === 'BUY'

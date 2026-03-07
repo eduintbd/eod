@@ -68,21 +68,24 @@ Deno.serve(async (req) => {
 
         // Step 3: Resolve client
         let clientId: string | null = null;
+        let clientCommissionRate: number | null = null;
         if (raw.bo_id) {
           const { data: client } = await supabase
             .from('clients')
-            .select('client_id')
+            .select('client_id, commission_rate')
             .eq('bo_id', raw.bo_id)
             .single();
           clientId = client?.client_id ?? null;
+          clientCommissionRate = client?.commission_rate != null ? Number(client.commission_rate) : null;
         }
         if (!clientId && raw.client_code) {
           const { data: client } = await supabase
             .from('clients')
-            .select('client_id')
+            .select('client_id, commission_rate')
             .eq('client_code', raw.client_code)
             .single();
           clientId = client?.client_id ?? null;
+          clientCommissionRate = client?.commission_rate != null ? Number(client.commission_rate) : null;
         }
 
         // Create placeholder client if not found
@@ -188,7 +191,7 @@ Deno.serve(async (req) => {
         // Step 5: Compute fees
         const side = raw.side === 'B' ? 'BUY' : 'SELL';
         const tradeValue = Number(raw.value) || 0;
-        const fees = calculateFees(tradeValue, side as 'BUY' | 'SELL', feeSchedule);
+        const fees = calculateFees(tradeValue, side as 'BUY' | 'SELL', feeSchedule, clientCommissionRate);
 
         // Step 6: Compute settlement date
         const settlementDate = raw.trade_date
