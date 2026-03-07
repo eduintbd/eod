@@ -336,3 +336,37 @@ export interface FeeScheduleEntry {
   created_at: string;
   updated_at: string;
 }
+
+// === EOD Process types ===
+
+export interface EodRun {
+  id: number;
+  eod_date: string;
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED';
+  started_at: string;
+  completed_at: string | null;
+  total_clients: number;
+  trades_for_date: number;
+  unprocessed_trades: number;
+  deposits_for_date: number;
+  prices_available: boolean;
+  snapshots_created: number;
+  margin_alerts_generated: number;
+  clients_with_negative_balance: number;
+  total_portfolio_value: number;
+  total_cash_balance: number;
+  total_loan_balance: number;
+  error_details: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface EodPreflight {
+  total_clients: number;
+  trades_for_date: number;
+  unprocessed_trades: number;
+  deposits_for_date: number;
+  prices_available: boolean;
+  already_run: boolean;
+  currently_running: boolean;
+  last_eod_date: string | null;
+}
