@@ -16,12 +16,19 @@ export const supabase = createClient(
 );
 
 /**
- * Admin client that bypasses RLS by using the service role key
- * without an auth session. Use for admin operations like
+ * Admin client that bypasses RLS by not carrying any auth session.
+ * Uses a separate storage key so it never picks up the logged-in
+ * user's session from the main client. Use for admin operations like
  * syncing prices, enriching securities, classifying marginability.
  */
 export const supabaseAdmin = createClient(
   supabaseUrl || 'http://localhost:54321',
   supabaseAnonKey || 'placeholder',
-  { auth: { autoRefreshToken: false, persistSession: false } }
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      storageKey: 'supabase-admin-no-session',
+    },
+  }
 );
