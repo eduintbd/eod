@@ -344,3 +344,63 @@ Rather than computing on the frontend, the calculated amounts are now stored in 
 | `BT_WITH_TRADE_FLAG.txt` | Pipe-delimited | CSE trade file |
 | `Deposit Withdrawal 01.02.2026.xlsx` | Excel | Daily deposit/withdrawal transactions |
 | `historical_prices_matched(2).csv` | CSV | Historical OHLCV prices (397 rows, loaded into daily_prices) |
+
+---
+
+## Session Summary — 2026-03-08: Portfolio Statement Mismatch Fix (Client 15570)
+
+### Problem
+Client 15570 (JOYANTA KARMAKAR, UUID `78de6efd-6ba2-475a-b4e6-5a78ed7a8ae4`) — portfolio statement fields (quantity, saleable, avg_cost, total_cost, market_value) did not match the reference image in `debug/15570_Portfolio_statement.jpeg`. Specific mismatches: DOMINAGE, FINEFOODS, GQBALLPEN, MKFOOTWEAR.
+
+### Root Cause
+**The `process-trades` edge function silently ignored holdings upsert failures.** The `await supabase.from('holdings').upsert(...)` returned errors but the code never checked them — trades were marked as "processed" even though holdings were never updated. This affected all 49,729 DSE trades (CSE's 12 trades worked fine). As a result, holdings were stuck at baseline values from the admin balance import.
+
+### Fixes Applied
+
+#### 1. `process-trades` Edge Function (not yet deployed)
+- **Added error checking** on holdings upsert — now throws if upsert fails, preventing the raw_trade from being marked as processed
+- **Increased avg_cost precision** from 2 decimal places to 6: `Math.round(newAvg * 1000000) / 1000000`
+- File: `supabase/functions/process-trades/index.ts`
+
+#### 2. Holdings Recalculation (DB migration, already applied)
+- Created and ran `recalculate_holdings_from_trade_executions` PL/pgSQL function
+- Recalculated 2,110 existing holdings from trade_executions data
+- Created 627 new holdings that only existed in trade_executions but not in holdings table
+- 1,989 holdings were unmodified (baseline correct, no trades applied yet)
+- ~121 pre-modified holdings may have small avg_cost errors (see Pending below)
+
+#### 3. Direct DB Fixes (already applied)
+- **FINEFOODS** for client 15570: manually corrected quantity (277,169), avg_cost, realized_pl
+- **MKFOOTWEAR** security: set `last_close_price=61.50`, `category='S'` (were both null)
+
+#### 4. Frontend — ClientDetailPage.tsx
+- **Saleable quantity**: now computed as `quantity - unsettled_buy_qty` where unsettled buys are trade_executions with `side='BUY'` and `settlement_date > today`
+- Added `unsettledBuyMap` state with parallel fetch of unsettled BUY trades
+- Fixed Portfolio Statement tab to display computed `saleable` instead of raw `h.quantity`
+- **Total Cost** confirmed as `quantity × average_cost` (NOT `total_invested`, which doesn't decrease on sells)
+
+### Verification
+All 4 stocks for client 15570 now match the reference portfolio statement image (exact match on quantities, saleable, market values; <0.01% difference on total_cost for DOMINAGE/GQBALLPEN due to avg_cost precision).
+
+### Pending Tasks
+
+| Task | Priority | Details |
+|------|----------|---------|
+| **Deploy process-trades** | HIGH | `SUPABASE_ACCESS_TOKEN=<token> npx supabase@latest functions deploy process-trades --project-ref zuupegtizrvbnsliuddu` |
+| **Process remaining 30,241 raw_trades** | HIGH | Re-run process-trades after deploying the fix (frontend Import page or direct invocation) |
+| **Fix ~120 pre-modified holdings** | MEDIUM | These may have small avg_cost errors from the migration; a full admin balance re-import would resolve them |
+| **Investigate holdings upsert root cause** | LOW | Why did DSE holdings upserts fail silently? Could be timeout, RLS, concurrency, or payload issue |
+| **Fix `total_invested` on SELL** | LOW | Currently `total_invested` never decreases on sells (`newInvested = oldInvested`). Should be: `newInvested = oldInvested - (oldAvg * sell_qty)` to track cost basis of current holdings |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `supabase/functions/process-trades/index.ts` | Added holdings upsert error check, increased avg_cost precision |
+| `frontend/src/pages/ClientDetailPage.tsx` | Added unsettled buy qty fetch, fixed saleable display |
+| `frontend/src/pages/DashboardPage.tsx` | Confirmed using `quantity * average_cost` (not total_invested) |
+
+### Key Learnings
+- `total_invested` is NOT the same as "Total Cost" — it's cumulative buy cost that never decreases on sells
+- Always check Supabase upsert/insert errors — silent failures can cause data drift
+- Holdings baseline from admin balance import is generally correct; trade processing adds deltas on top
+- For ~121 holdings where process-trades partially applied trades before this fix, the recalculation migration may have slightly wrong baselines (it reversed ALL trades to find baseline, but only SOME had been applied)

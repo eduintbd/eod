@@ -16,7 +16,8 @@ export function ClientDetailPage() {
   const [cashEntries, setCashEntries] = useState<CashLedgerEntry[]>([]);
   const [trades, setTrades] = useState<TradeExecution[]>([]);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'summary' | 'holdings' | 'cash' | 'trades' | 'margin'>('summary');
+  const [tab, setTab] = useState<'summary' | 'holdings' | 'cash' | 'trades' | 'margin' | 'portfolio'>('summary');
+  const [unsettledBuyMap, setUnsettledBuyMap] = useState<Record<string, number>>({});
 
   // Summary tab state
   const [summaryFrom, setSummaryFrom] = useState('');
@@ -31,7 +32,8 @@ export function ClientDetailPage() {
     if (!clientId) return;
 
     async function load() {
-      const [clientRes, holdingsRes, cashRes, tradesRes] = await Promise.all([
+      const today = new Date().toISOString().slice(0, 10);
+      const [clientRes, holdingsRes, cashRes, tradesRes, unsettledRes] = await Promise.all([
         supabase.from('clients').select('*').eq('client_id', clientId).single(),
         supabase
           .from('holdings')
@@ -51,7 +53,21 @@ export function ClientDetailPage() {
           .eq('client_id', clientId)
           .order('trade_date', { ascending: false })
           .limit(100),
+        // Fetch unsettled BUY trades to compute saleable quantity
+        supabase
+          .from('trade_executions')
+          .select('isin, quantity')
+          .eq('client_id', clientId)
+          .eq('side', 'BUY')
+          .gt('settlement_date', today),
       ]);
+
+      // Build map of isin -> total unsettled buy quantity
+      const buyMap: Record<string, number> = {};
+      for (const row of (unsettledRes.data ?? [])) {
+        buyMap[row.isin] = (buyMap[row.isin] || 0) + row.quantity;
+      }
+      setUnsettledBuyMap(buyMap);
 
       setClient(clientRes.data as Client | null);
       setHoldings((holdingsRes.data ?? []) as (Holding & { security?: Security })[]);
@@ -214,6 +230,7 @@ export function ClientDetailPage() {
     { key: 'cash' as const, label: 'Cash Ledger' },
     { key: 'trades' as const, label: 'Trade History' },
     { key: 'margin' as const, label: 'Margin' },
+    { key: 'portfolio' as const, label: 'Portfolio Statement' },
   ];
 
   return (
@@ -707,6 +724,337 @@ export function ClientDetailPage() {
             </div>
           )
         )}
+
+        {tab === 'portfolio' && (() => {
+          const today = new Date();
+          const dateStr = `${String(today.getDate()).padStart(2, '0')}-${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][today.getMonth()]}-${today.getFullYear()}`;
+
+          // Separate holdings by marginability
+          const nonMarginable = holdings.filter(h => !h.security?.is_marginable);
+          const marginable = holdings.filter(h => h.security?.is_marginable);
+
+          // Compute per-holding data
+          function holdingRow(h: (typeof holdings)[0]) {
+            const lp = getLivePrice(h);
+            const cost = h.quantity * h.average_cost;
+            const mv = h.quantity * lp;
+            const ugl = mv - cost;
+            const pctGain = cost > 0 ? (ugl / cost) * 100 : 0;
+            const pctMv = totalMarketValue > 0 ? (mv / totalMarketValue) * 100 : 0;
+            const saleable = h.quantity - (unsettledBuyMap[h.isin] || 0);
+            return { lp, cost, mv, ugl, pctGain, pctMv, saleable };
+          }
+
+          function sectionTotal(group: typeof holdings) {
+            return group.reduce((acc, h) => {
+              const r = holdingRow(h);
+              acc.cost += r.cost;
+              acc.mv += r.mv;
+              acc.ugl += r.ugl;
+              acc.pctMv += r.pctMv;
+              return acc;
+            }, { cost: 0, mv: 0, ugl: 0, pctMv: 0 });
+          }
+
+          sectionTotal(nonMarginable); // included in grand total
+          const margTotal = sectionTotal(marginable);
+
+          // Account status calculations
+          const receivableSales = 0; // placeholder
+          const ledgerBalance = cashBalance + receivableSales;
+          const accruedFees = 0;
+          const currentAssetLiabilities = ledgerBalance + accruedFees;
+          const marginableEquity = margTotal.mv;
+          const totalEquityVal = currentAssetLiabilities + totalMarketValue;
+          const loanRatio = marginAccount?.loan_balance ? (marginAccount.loan_balance / totalEquityVal) : 0;
+          const purchasePower = currentAssetLiabilities > 0 ? currentAssetLiabilities : 0;
+          const netAssetValue = totalEquityVal;
+
+          // Deposit & withdrawal
+          const realizedGainLoss = totalRealizedPl;
+          const adjustedDeposit = totalDeposit + realizedGainLoss;
+          const netDepositVal = adjustedDeposit;
+          const netGainLoss = unrealizedPl + realizedGainLoss;
+
+          let sn = 0;
+
+          return (
+            <div className="p-6 space-y-6">
+              {/* Company Header */}
+              <div className="flex justify-between items-start border-b border-border pb-4">
+                <div>
+                  <h2 className="text-xl font-bold">UCB Stock Brokerage Limited.</h2>
+                  <p className="text-sm font-semibold">TREC Holder: DSE #181 | CSE#015</p>
+                  <p className="text-xs text-muted-foreground">"BULUS CENTER" (17th floor, west side), Plot-CWS(A)1, Road No-34, Gulshan Avenue</p>
+                  <p className="text-xs text-muted-foreground">Phone : (+88) 09678-175175, Fax : N.A.</p>
+                  <p className="text-xs text-muted-foreground">Email : info@ucbstock.com.bd, Web : www.ucbstock.com.bd</p>
+                </div>
+              </div>
+
+              {/* Title */}
+              <h3 className="text-center text-base font-bold underline">Portfolio Statement</h3>
+
+              {/* Client Info Grid */}
+              <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-sm">
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Name</span>
+                  <span>: {client.name}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Date</span>
+                  <span>: {dateStr}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Investor Code</span>
+                  <span>: {client.client_code}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Account Type</span>
+                  <span>: {client.category === 'institution' ? 'Institutional Account' : client.category === 'foreign' ? 'Foreign Account' : 'Individual Account'}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">BOID</span>
+                  <span>: {client.bo_id}</span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Account Status</span>
+                  <span>: {client.status === 'active' ? 'Active' : client.status === 'suspended' ? 'Suspended' : client.status === 'closed' ? 'Closed' : 'Pending Review'}</span>
+                </div>
+                <div />
+                <div className="flex gap-2">
+                  <span className="font-semibold min-w-[140px]">Account Category</span>
+                  <span>: {client.account_type === 'Margin' ? 'Margin' : 'Non Margin'}</span>
+                </div>
+              </div>
+
+              {/* Holdings Table */}
+              <table className="w-full text-xs border-collapse">
+                <thead>
+                  <tr className="border-y-2 border-foreground text-left bg-muted/50 font-bold">
+                    <th className="p-1.5">SN</th>
+                    <th className="p-1.5">Instrument</th>
+                    <th className="p-1.5">Group</th>
+                    <th className="p-1.5 text-right">Qty Total</th>
+                    <th className="p-1.5 text-right">Qty Saleable</th>
+                    <th className="p-1.5 text-right">Avg Cost</th>
+                    <th className="p-1.5 text-right">Total Cost (TK.)</th>
+                    <th className="p-1.5 text-right">Market Rate</th>
+                    <th className="p-1.5 text-right">Market Value (TK.)</th>
+                    <th className="p-1.5 text-right">Unrealized Gain/(Loss)</th>
+                    <th className="p-1.5 text-right">%Gain/(Loss)</th>
+                    <th className="p-1.5 text-right">%Mkt Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {/* Non Marginable Section */}
+                  {nonMarginable.length > 0 && (
+                    <>
+                      <tr className="bg-muted/30">
+                        <td colSpan={12} className="p-1.5 font-bold text-xs">Non Marginable Instrument</td>
+                      </tr>
+                      {nonMarginable.map(h => {
+                        sn++;
+                        const r = holdingRow(h);
+                        return (
+                          <tr key={h.isin} className="border-b border-border">
+                            <td className="p-1.5">{sn}</td>
+                            <td className="p-1.5">{h.security?.security_code ?? h.isin}</td>
+                            <td className="p-1.5">{h.security?.category ?? '—'}</td>
+                            <td className="p-1.5 text-right">{formatNumber(h.quantity, 0)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.saleable, 0)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(h.average_cost)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.cost)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.lp)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.mv)}</td>
+                            <td className={`p-1.5 text-right ${r.ugl >= 0 ? '' : 'text-destructive'}`}>{formatNumber(r.ugl)}</td>
+                            <td className={`p-1.5 text-right ${r.pctGain >= 0 ? '' : 'text-destructive'}`}>{formatNumber(r.pctGain, 2)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.pctMv, 2)}</td>
+                          </tr>
+                        );
+                      })}
+                    </>
+                  )}
+
+                  {/* Marginable Section */}
+                  {marginable.length > 0 && (
+                    <>
+                      <tr className="bg-muted/30">
+                        <td colSpan={12} className="p-1.5 font-bold text-xs">Marginable Instrument</td>
+                      </tr>
+                      {marginable.map(h => {
+                        sn++;
+                        const r = holdingRow(h);
+                        return (
+                          <tr key={h.isin} className="border-b border-border">
+                            <td className="p-1.5">{sn}</td>
+                            <td className="p-1.5">{h.security?.security_code ?? h.isin}</td>
+                            <td className="p-1.5">{h.security?.category ?? '—'}</td>
+                            <td className="p-1.5 text-right">{formatNumber(h.quantity, 0)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.saleable, 0)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(h.average_cost)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.cost)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.lp)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.mv)}</td>
+                            <td className={`p-1.5 text-right ${r.ugl >= 0 ? '' : 'text-destructive'}`}>{formatNumber(r.ugl)}</td>
+                            <td className={`p-1.5 text-right ${r.pctGain >= 0 ? '' : 'text-destructive'}`}>{formatNumber(r.pctGain, 2)}</td>
+                            <td className="p-1.5 text-right">{formatNumber(r.pctMv, 2)}</td>
+                          </tr>
+                        );
+                      })}
+                    </>
+                  )}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t-2 border-foreground font-bold">
+                    <td className="p-1.5" colSpan={6} style={{ textAlign: 'right' }}>Total:</td>
+                    <td className="p-1.5 text-right">{formatNumber(totalCost)}</td>
+                    <td className="p-1.5" />
+                    <td className="p-1.5 text-right">{formatNumber(totalMarketValue)}</td>
+                    <td className={`p-1.5 text-right ${unrealizedPl >= 0 ? '' : 'text-destructive'}`}>{formatNumber(unrealizedPl)}</td>
+                    <td className="p-1.5" />
+                    <td className="p-1.5" />
+                  </tr>
+                  <tr className="border-t border-foreground font-bold bg-muted/30">
+                    <td className="p-1.5" colSpan={6} style={{ textAlign: 'right' }}>Grand Total:</td>
+                    <td className="p-1.5 text-right">{formatNumber(totalCost)}</td>
+                    <td className="p-1.5" />
+                    <td className="p-1.5 text-right">{formatNumber(totalMarketValue)}</td>
+                    <td className={`p-1.5 text-right ${unrealizedPl >= 0 ? '' : 'text-destructive'}`}>{formatNumber(unrealizedPl)}</td>
+                    <td className="p-1.5" />
+                    <td className="p-1.5" />
+                  </tr>
+                </tfoot>
+              </table>
+
+              {/* Account Status Till Today */}
+              <div>
+                <h4 className="text-sm font-bold border-b border-foreground pb-1 mb-2">Account Status Till Today</h4>
+                <div className="grid grid-cols-2 gap-x-12 text-sm">
+                  <div className="space-y-1">
+                    <div className="flex justify-between">
+                      <span>Mature Balance</span>
+                      <span>: {formatNumber(cashBalance)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Receivable Sales</span>
+                      <span>: {formatNumber(receivableSales)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Cheque In Hand/Transit</span>
+                      <span>: {formatNumber(0)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Ledger Balance</span>
+                      <span>: {formatNumber(ledgerBalance)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Accrued Fees & Charges</span>
+                      <span>: {formatNumber(accruedFees)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Current Asset/Liabilities</span>
+                      <span>: {formatNumber(currentAssetLiabilities)}</span>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between">
+                      <span>Market Value of Securities</span>
+                      <span>: {formatNumber(totalMarketValue)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Equity (Marginable)</span>
+                      <span>: {formatNumber(marginableEquity)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Total Equity</span>
+                      <span>: {formatNumber(totalEquityVal)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Loan Ratio</span>
+                      <span>: {formatNumber(loanRatio, 4)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Purchase Power</span>
+                      <span>: {formatNumber(purchasePower)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Net Asset Value</span>
+                      <span>: {formatNumber(netAssetValue)}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Deposit & Withdrawal Status */}
+              <div>
+                <h4 className="text-sm font-bold border-b border-foreground pb-1 mb-2">Deposit & Withdrawal Status</h4>
+                <div className="grid grid-cols-2 gap-x-12 text-sm">
+                  <div className="space-y-1">
+                    <div className="flex justify-between">
+                      <span>Deposit</span>
+                      <span>: {formatNumber(totalDeposit)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Realized Gain/(Loss)</span>
+                      <span>: {formatNumber(realizedGainLoss)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Adjusted Deposit</span>
+                      <span>: {formatNumber(adjustedDeposit)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Withdrawal</span>
+                      <span>: {formatNumber(0)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Net Deposit</span>
+                      <span>: {formatNumber(netDepositVal)}</span>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between">
+                      <span>Realized Gain/Loss As On</span>
+                      <span>: {formatNumber(realizedGainLoss)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Unrealized Gain</span>
+                      <span>: {formatNumber(unrealizedPl)}</span>
+                    </div>
+                    <div className="flex justify-between font-bold border-t border-border pt-1">
+                      <span>Net Gain/Loss</span>
+                      <span>: {formatNumber(netGainLoss)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Realized Gain/Loss Fin. Year</span>
+                      <span>: {formatNumber(realizedGainLoss)}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Cash Dividend Receivable */}
+              <div>
+                <h4 className="text-sm font-bold border-b border-foreground pb-1 mb-2">Cash Dividend Receivable</h4>
+                <table className="w-full text-xs border-collapse">
+                  <thead>
+                    <tr className="border-y border-foreground text-left bg-muted/50 font-bold">
+                      <th className="p-1.5">Instrument Code</th>
+                      <th className="p-1.5">Category</th>
+                      <th className="p-1.5 text-right">Cash Receivable</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td colSpan={3} className="p-3 text-center text-muted-foreground text-xs">
+                        No dividend data available yet.
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );

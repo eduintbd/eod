@@ -265,17 +265,19 @@ Deno.serve(async (req) => {
           newRealizedPl = oldRealizedPl + (fees.net_value - costBasis * raw.quantity);
         }
 
-        await supabase
+        const { error: holdingsErr } = await supabase
           .from('holdings')
           .upsert({
             client_id: clientId,
             isin,
             quantity: newQty,
-            average_cost: Math.round(newAvg * 100) / 100,
+            average_cost: Math.round(newAvg * 1000000) / 1000000,
             total_invested: Math.round(newInvested * 100) / 100,
             realized_pl: Math.round(newRealizedPl * 100) / 100,
             as_of_date: raw.trade_date,
           }, { onConflict: 'client_id,isin' });
+
+        if (holdingsErr) throw new Error(`Update holdings: ${holdingsErr.message}`);
 
         // Step 9: Update cash ledger
         const { data: lastLedger } = await supabase
