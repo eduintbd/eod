@@ -386,8 +386,8 @@ All 4 stocks for client 15570 now match the reference portfolio statement image 
 
 | Task | Priority | Details |
 |------|----------|---------|
-| **Deploy process-trades** | HIGH | `SUPABASE_ACCESS_TOKEN=<token> npx supabase@latest functions deploy process-trades --project-ref zuupegtizrvbnsliuddu` |
-| **Process remaining 30,241 raw_trades** | HIGH | Re-run process-trades after deploying the fix (frontend Import page or direct invocation) |
+| ~~**Deploy process-trades**~~ | ~~HIGH~~ | DONE (session 2026-03-08) |
+| ~~**Process remaining 30,241 raw_trades**~~ | ~~HIGH~~ | DONE (session 2026-03-08) — all were non-FILL statuses |
 | **Fix ~120 pre-modified holdings** | MEDIUM | These may have small avg_cost errors from the migration; a full admin balance re-import would resolve them |
 | **Investigate holdings upsert root cause** | LOW | Why did DSE holdings upserts fail silently? Could be timeout, RLS, concurrency, or payload issue |
 | **Fix `total_invested` on SELL** | LOW | Currently `total_invested` never decreases on sells (`newInvested = oldInvested`). Should be: `newInvested = oldInvested - (oldAvg * sell_qty)` to track cost basis of current holdings |
@@ -404,3 +404,82 @@ All 4 stocks for client 15570 now match the reference portfolio statement image 
 - Always check Supabase upsert/insert errors — silent failures can cause data drift
 - Holdings baseline from admin balance import is generally correct; trade processing adds deltas on top
 - For ~121 holdings where process-trades partially applied trades before this fix, the recalculation migration may have slightly wrong baselines (it reversed ALL trades to find baseline, but only SOME had been applied)
+
+---
+
+## Session Summary — 2026-03-09: Jan 14 Trade Processing & Bulk SQL Migration
+
+### Problem
+Jan 14 trade file was imported (98,568 raw_trades) but only 105 were processed. The `process-trades` edge function timed out — it processes 200 trades per call, each trade making ~6 sequential HTTP round-trips to the database. With 35,772 FILL/PF trades, this was impossible via the edge function.
+
+### Root Cause
+The edge function's `.limit(200)` batch size + ~8 DB queries per trade over HTTP = **timeout before completing even one batch**. The 200-trade batch was already the maximum the edge function could handle within Supabase's wall-clock limit, but even that was failing for Jan 14's larger dataset.
+
+### Solution: Server-Side SQL Processing
+
+Created three PostgreSQL functions to replace the edge function for batch processing:
+
+#### 1. `bulk_process_trades(batch_size int DEFAULT 5000)`
+PL/pgSQL function that does the **exact same logic** as the edge function but runs directly inside PostgreSQL — no HTTP overhead. Processes trades in a loop with per-trade error handling:
+- Dedup by exec_id
+- Resolve client (bo_id → client_code → create placeholder)
+- Resolve security (security_code → isin → create placeholder)
+- Calculate fees (commission, exchange, CDBL min ৳5, AIT; client-specific rates)
+- Compute settlement date (T+2/T+3, Bangladesh weekends)
+- Insert trade_execution
+- Update holdings (BUY: weighted avg; SELL: realized P&L)
+- Insert cash_ledger entry
+- Mark raw_trade processed
+
+Returns: `{"processed": N, "skipped": N, "failed": N}`
+
+#### 2. `mark_nonfill_trades_processed()`
+Bulk-marks all non-FILL/PF trades (ACK, RPLD, CXLD, EXPIRED, REJ, null) as processed in one UPDATE.
+
+#### 3. `add_bd_business_days(start_date date, num_days int)`
+Bangladesh business day calculator — skips Friday (5) and Saturday (6).
+
+### Frontend Integration
+Updated `useImport.ts` `processTrades()` function:
+- **Before:** `supabase.functions.invoke('process-trades')` — 200 trades/batch, times out
+- **After:** `supabase.rpc('bulk_process_trades', { batch_size: 5000 })` — 5000 trades/batch, no timeout
+- Added pre-step: `supabase.rpc('mark_nonfill_trades_processed')` to clear non-fills first
+- Loop continues until `processed === 0`
+
+### Jan 14 Processing Results
+| Metric | Count |
+|--------|-------|
+| Total raw_trades | 98,568 |
+| Non-fill (marked processed) | 62,796 |
+| FILL/PF processed → trade_executions | 17,893 |
+| Duplicates skipped | ~17,879 (PF + FILL rows for same exec_id) |
+| Failed | 0 |
+| Trade executions total (Jan 13 + 14) | 37,391 |
+
+### Performance Comparison
+| Method | Batch Size | 35,772 trades |
+|--------|-----------|---------------|
+| Edge function (HTTP) | 200 | **Impossible** (timeout) |
+| SQL function (in-process) | 5,000 | **~3.5 minutes** (7 batches) |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `frontend/src/hooks/useImport.ts` | Replaced edge function call with `supabase.rpc('bulk_process_trades')` |
+| `LEARNING.md` | Added bulk SQL function documentation under "Why Trade Processing Is Slow" |
+
+### Database Functions Created
+| Function | Purpose |
+|----------|---------|
+| `bulk_process_trades(batch_size)` | Main trade processor — runs inside Postgres |
+| `mark_nonfill_trades_processed()` | Bulk-mark non-fill trades |
+| `add_bd_business_days(date, days)` | Bangladesh business day calculator |
+
+### Pending Tasks
+
+| Task | Priority | Details |
+|------|----------|---------|
+| **Load Jan 14 daily prices** | HIGH | Need daily_prices for Jan 14 to compute portfolio valuations |
+| **Fix ~120 pre-modified holdings** | MEDIUM | Small avg_cost errors from recalculation migration |
+| **Optimize bulk_process_trades to set-based** | LOW | Current function is still O(N) per-trade loop; ideal is JOIN/GROUP BY for O(1) queries |
+| **Fix `total_invested` on SELL** | LOW | Never decreases on sells |

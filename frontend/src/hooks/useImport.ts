@@ -1054,13 +1054,20 @@ export function useImport() {
     }));
   };
 
-  // Trigger trade processing edge function — loops in batches of 200 until done
+  // Trigger trade processing via bulk SQL function — loops in batches of 5000 until done
   const processTrades = useCallback(async (importAuditId?: number) => {
     setProgress(p => ({ ...p, stage: 'processing', message: 'Processing trades...' }));
 
     let totalProcessed = 0;
     let totalFailed = 0;
+    let totalSkipped = 0;
     let batchNum = 0;
+
+    // First: mark non-fill trades as processed (they don't affect positions)
+    const { error: markErr } = await supabase.rpc('mark_nonfill_trades_processed');
+    if (markErr) {
+      console.warn('mark_nonfill_trades_processed failed (may not exist):', markErr.message);
+    }
 
     // Loop until no more trades to process
     while (true) {
@@ -1070,8 +1077,8 @@ export function useImport() {
         message: `Processing batch ${batchNum}... (${totalProcessed} processed so far)`,
       }));
 
-      const { data, error } = await supabase.functions.invoke('process-trades', {
-        body: { import_audit_id: importAuditId },
+      const { data, error } = await supabase.rpc('bulk_process_trades', {
+        batch_size: 5000,
       });
 
       if (error) {
@@ -1088,28 +1095,24 @@ export function useImport() {
           return;
         }
 
-        let errorMsg = error.message;
-        if (data?.error) errorMsg = data.error;
         setProgress(p => ({
           ...p,
           stage: 'error',
           message: undefined,
-          errorMessage: errorMsg,
+          errorMessage: error.message,
         }));
         return;
       }
 
-      const batchProcessed = data?.processed_count ?? 0;
-      const batchFailed = data?.failed_count ?? 0;
+      const batchProcessed = data?.processed ?? 0;
+      const batchFailed = data?.failed ?? 0;
+      const batchSkipped = data?.skipped ?? 0;
       totalProcessed += batchProcessed;
       totalFailed += batchFailed;
+      totalSkipped += batchSkipped;
 
-      // If this batch had no trades, we're done
+      // If this batch had no new trades processed, we're done
       if (batchProcessed === 0 && batchFailed === 0) break;
-
-      // If there were fewer than 200 trades in this batch, we're done
-      const totalInBatch = (data?.total_raw ?? 0);
-      if (totalInBatch < 200) break;
 
       setProgress(p => ({
         ...p,
