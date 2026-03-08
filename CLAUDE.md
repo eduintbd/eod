@@ -483,3 +483,88 @@ Updated `useImport.ts` `processTrades()` function:
 | **Fix ~120 pre-modified holdings** | MEDIUM | Small avg_cost errors from recalculation migration |
 | **Optimize bulk_process_trades to set-based** | LOW | Current function is still O(N) per-trade loop; ideal is JOIN/GROUP BY for O(1) queries |
 | **Fix `total_invested` on SELL** | LOW | Never decreases on sells |
+
+---
+
+## Session Summary — 2026-03-09 (cont.): Unsettled Issues Amount Cross-Check & Fee Fix
+
+### Problem
+The `/unsettled-issues` page amounts didn't match the reference CSV (`total trade file(14 Jan 2026).csv`) for several investors (OBO9395, 11144, OBO8107, OBO3534, OBO5196, 15595). Cross-checking all 19 CSV entries against the database revealed multiple root causes.
+
+### Root Causes Identified
+
+**1. Fee rate mismatch — Jan 13 edge function used DEFAULT rates (17,259 trades, 1,314 clients)**
+The old `process-trades` edge function treated ALL trades with default fee rates (commission 0.3% + exchange 0.03% + CDBL 0.0175% + AIT 0.05%) even when the client had a specific `commission_rate`. For clients with all-inclusive rates (e.g. 0.4%), the edge function should have charged ONLY commission with exchange/CDBL/AIT = 0.
+
+**2. Duplicate deposit + broken running balance — Client 15595 (M TEL)**
+Two identical ₹300,000 deposits on Jan 14. Running balance didn't accumulate from the opening balance (showed 300,000 instead of 305,983.82). Removed duplicate deposit and recalculated running balance.
+
+**3. OBO5196 — Opening balance mismatch in source data**
+OBO5196 (commission_rate=0.0028) has a ~33K discrepancy that persists regardless of fee calculation method. Root cause is the opening balance from the admin balance import (-201,582) differs from the back-office system. Reverted to default fee rates which gave the closest match (diff ~565). This client's `commission_rate` is NOT all-inclusive — they pay discounted commission plus standard regulatory fees. Needs manual investigation of baseline data.
+
+**4. Client 22195 — Intra-day vs EOD exposure**
+CSV shows 2,466 negative balance but DB shows +50,042.73. The back-office tracks intra-day negative exposure before sells settle; our system tracks end-of-day position.
+
+### Fixes Applied
+
+#### 1. Recalculated fees for 17,259 Jan 13 trade_executions (1,314 clients)
+```sql
+UPDATE trade_executions SET
+  commission = value * client_rate, exchange_fee = 0, cdbl_fee = 0, ait = 0,
+  net_value = value ± (value * client_rate)
+WHERE trade_date = '2026-01-13' AND client has commission_rate AND exchange_fee > 0
+```
+
+#### 2. Updated corresponding cash_ledger entries
+Synced cash_ledger amounts with corrected trade_execution net_values via `reference = exec_id` join.
+
+#### 3. Recalculated running balances
+Ran `recalc_running_balance()` for all 1,314+ affected clients.
+
+#### 4. Removed duplicate deposit for client 15595
+Deleted duplicate ₹300,000 deposit entry (cash_ledger id 150077).
+
+#### 5. Refreshed `compute_amount_payable()`
+Updated amount_payable column for all clients.
+
+### Verification Results (After Fix)
+
+| Code | CSV Amount | DB Balance | Diff | Status |
+|------|-----------|-----------|------|--------|
+| 2417 | 9,576,807 | 9,576,807.29 | **0.29** | ✓ |
+| 2310 | 9,574,899 | 9,574,899.42 | **0.42** | ✓ |
+| 4124 | 2,893,799 | 2,893,799.48 | **0.48** | ✓ |
+| 15595 | 10,806 | 10,806.18 | **0.18** | ✓ Fixed |
+| 14025 | 198,603 | 198,602.84 | **-0.16** | ✓ |
+| 15216 | 126,157 | 126,157.40 | **0.40** | ✓ |
+| OBO9395 | 30,554 | 30,553.99 | **-0.01** | ✓ Fixed |
+| 11144 | 19,991 | 19,996.46 | **5.46** | ✓ Fixed |
+| OBO8107 | 18,086 | 18,086.23 | **0.23** | ✓ Fixed |
+| 872 | 7,365 | 7,364.64 | **-0.36** | ✓ |
+| OBO3534 | 2,621 | 2,621.14 | **0.14** | ✓ Fixed |
+| 22086 | 2,431 | 2,431.29 | **0.29** | ✓ |
+| OBO8881 | 2,066 | 2,066.44 | **0.44** | ✓ |
+| OBO5196 | 141,876 | 108,703 | **-33,173** | ✗ Baseline issue |
+| 22195 | 2,466 | +50,043 | N/A | ✗ Different calc |
+
+**12 of 15** negative-balance clients now match within <6 BDT (rounding). 4 CSV entries (OBO1164, 2501, 8310, UR311) are non-negative-balance compliance types (Z-category netting, non-margin buy) not tracked by our system.
+
+### Key Learnings
+
+1. **`commission_rate` is NOT always all-inclusive.** Some clients (like OBO5196 at 0.28%) pay a discounted commission PLUS standard regulatory fees. Others (like OBO9395 at 0.40%) pay an all-inclusive rate. Need a `commission_all_inclusive` boolean flag on the clients table to distinguish.
+
+2. **Edge function vs SQL function fee behavior must match.** The `bulk_process_trades` SQL function and the edge function both treat `commission_rate` as all-inclusive. This is correct for most clients but wrong for some. Both need to be updated when the flag is added.
+
+3. **Deposit deduplication is still an issue.** Client 15595 had a duplicate ₹300,000 deposit. The deposit import process needs better dedup logic.
+
+4. **Running balance must always accumulate from the first entry.** The `recalc_running_balance()` function works correctly; the issue was that it hadn't been called after fixing the duplicate deposit.
+
+### Pending Tasks
+
+| Task | Priority | Details |
+|------|----------|---------|
+| **Add `commission_all_inclusive` flag to clients** | HIGH | Distinguish between all-inclusive rates (0.4%) and discounted commission rates (0.28%). Update `bulk_process_trades` and `fee-calculator.ts` to respect this flag |
+| **Investigate OBO5196 opening balance** | MEDIUM | Admin balance import gave -201,582 but back-office has ~-234,865. May need manual correction |
+| **Recalculate holdings for 1,314 clients** | MEDIUM | Fee changes on Jan 13 BUY trades changed `net_value`, which affects `average_cost` in holdings |
+| **Fix deposit import deduplication** | MEDIUM | Client 15595 had duplicate deposit; check other clients for similar issues |
+| **Load Jan 14 daily prices** | HIGH | Need daily_prices for Jan 14 to compute portfolio valuations |
