@@ -1,12 +1,14 @@
 import { useEffect, useState, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, RefreshCw, Shield } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Shield, ChevronDown, ChevronUp } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { formatBDT, formatNumber, formatPct, formatMarginPct, getMarginStatusColor } from '@/lib/utils';
 import { useLatestPrices } from '@/hooks/useMarketData';
 import { useMarginAccount } from '@/hooks/useMarginData';
 import { useMarginAlerts } from '@/hooks/useAlerts';
 import { useClientSnapshots } from '@/hooks/useSnapshots';
+import { useAuth } from '@/hooks/useAuth';
+import { useCommissionRateHistory, useChangeCommissionRate } from '@/hooks/useCommissionRate';
 import type { Client, Holding, CashLedgerEntry, TradeExecution, Security } from '@/lib/types';
 
 export function ClientDetailPage() {
@@ -19,6 +21,17 @@ export function ClientDetailPage() {
   const [tab, setTab] = useState<'summary' | 'holdings' | 'cash' | 'trades' | 'margin' | 'portfolio'>('summary');
   const [unsettledBuyMap, setUnsettledBuyMap] = useState<Record<string, number>>({});
 
+  // Commission rate change state
+  const { role } = useAuth();
+  const { changes: commissionHistory, refresh: refreshHistory } = useCommissionRateHistory(clientId);
+  const { changeRate, saving: savingRate } = useChangeCommissionRate();
+  const [showRateForm, setShowRateForm] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [newRate, setNewRate] = useState('');
+  const [effectiveDate, setEffectiveDate] = useState(new Date().toISOString().slice(0, 10));
+  const [rateReason, setRateReason] = useState('');
+  const [rateError, setRateError] = useState<string | null>(null);
+
   // Summary tab state
   const [summaryFrom, setSummaryFrom] = useState('');
   const [summaryTo, setSummaryTo] = useState('');
@@ -27,6 +40,7 @@ export function ClientDetailPage() {
   const [totalDeposit, setTotalDeposit] = useState(0);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [securitiesMap, setSecuritiesMap] = useState<Record<string, string>>({});
+  const [summaryDepositWithdrawals, setSummaryDepositWithdrawals] = useState<CashLedgerEntry[]>([]);
 
   useEffect(() => {
     if (!clientId) return;
@@ -100,7 +114,7 @@ export function ClientDetailPage() {
 
     async function loadSummary() {
       setSummaryLoading(true);
-      const [balanceRes, balanceFallbackRes, tradesRes, depositRes, secRes] = await Promise.all([
+      const [balanceRes, balanceFallbackRes, tradesRes, depositRes, depWithdrawRes, secRes] = await Promise.all([
         // Opening balance: last cash_ledger entry before from_date
         supabase
           .from('cash_ledger')
@@ -133,6 +147,17 @@ export function ClientDetailPage() {
           .select('amount')
           .eq('client_id', clientId!)
           .eq('type', 'DEPOSIT'),
+        // Deposits/withdrawals in date range (for summary rows)
+        summaryFrom && summaryTo
+          ? supabase
+              .from('cash_ledger')
+              .select('*')
+              .eq('client_id', clientId!)
+              .in('type', ['DEPOSIT', 'WITHDRAWAL'])
+              .gte('transaction_date', summaryFrom)
+              .lte('transaction_date', summaryTo)
+              .order('id')
+          : Promise.resolve({ data: [], error: null }),
         // Securities lookup for codes
         supabase
           .from('securities')
@@ -146,6 +171,7 @@ export function ClientDetailPage() {
       );
       setSummaryTrades((tradesRes.data ?? []) as TradeExecution[]);
       setTotalDeposit(depositRes.data?.reduce((sum: number, d: { amount: number }) => sum + d.amount, 0) ?? 0);
+      setSummaryDepositWithdrawals((depWithdrawRes.data ?? []) as unknown as CashLedgerEntry[]);
 
       // Build isin → security_code map
       const map: Record<string, string> = {};
@@ -176,14 +202,72 @@ export function ClientDetailPage() {
 
   // Compute summary running balances (must be before early returns — Rules of Hooks)
   const summaryRows = useMemo(() => {
-    let balance = openingBalance;
-    return summaryTrades.map(t => {
-      const debit = t.side === 'BUY' ? t.net_value : 0;
-      const credit = t.side === 'SELL' ? t.net_value : 0;
-      balance = balance - debit + credit;
-      return { ...t, debit, credit, balance };
+    // Merge trades + deposits/withdrawals into a unified list sorted by date then id
+    type SummaryRow = {
+      exec_id: string;
+      trade_date: string;
+      side: string;
+      isin: string;
+      quantity: number;
+      price: number;
+      net_value: number;
+      debit: number;
+      credit: number;
+      balance: number;
+      _sortId: number;
+    };
+
+    const tradeItems = summaryTrades.map(t => ({
+      exec_id: t.exec_id,
+      trade_date: t.trade_date ?? '',
+      side: t.side,
+      isin: t.isin,
+      quantity: Number(t.quantity) || 0,
+      price: Number(t.price) || 0,
+      net_value: Number(t.net_value) || 0,
+      _sortId: 0, // will use exec_id for ordering within same date
+    }));
+
+    const depItems = summaryDepositWithdrawals.map((d, idx) => ({
+      exec_id: `dep-${d.id ?? idx}`,
+      trade_date: d.transaction_date ?? '',
+      side: d.type === 'DEPOSIT' ? 'RECEIPT' : 'PAYMENT',
+      isin: '',
+      quantity: 0,
+      price: 0,
+      net_value: Number(d.amount) || 0,
+      _sortId: d.id ?? 0,
+    }));
+
+    // Sort: trades by trade_date + exec_id, deposits by date + id
+    // Deposits should appear AFTER trades on the same date (matching investor ledger order)
+    const allItems = [...tradeItems.map(t => ({ ...t, _isDeposit: false })), ...depItems.map(d => ({ ...d, _isDeposit: true }))];
+    allItems.sort((a, b) => {
+      const dateA = a.trade_date ?? '';
+      const dateB = b.trade_date ?? '';
+      if (dateA !== dateB) return dateA.localeCompare(dateB);
+      // Deposits after trades on same date
+      if (a._isDeposit !== b._isDeposit) return a._isDeposit ? 1 : -1;
+      return (a.exec_id ?? '').localeCompare(b.exec_id ?? '');
     });
-  }, [summaryTrades, openingBalance]);
+
+    let balance = openingBalance;
+    return allItems.map(item => {
+      let debit = 0;
+      let credit = 0;
+      if (item.side === 'BUY') {
+        debit = item.net_value;
+      } else if (item.side === 'SELL') {
+        credit = item.net_value;
+      } else if (item.side === 'RECEIPT') {
+        credit = item.net_value;
+      } else if (item.side === 'PAYMENT') {
+        debit = Math.abs(item.net_value);
+      }
+      balance = balance - debit + credit;
+      return { ...item, debit, credit, balance } as SummaryRow;
+    });
+  }, [summaryTrades, summaryDepositWithdrawals, openingBalance]);
 
   if (loading) return <div className="text-muted-foreground">Loading...</div>;
   if (!client) return <div className="text-destructive">Client not found</div>;
@@ -289,6 +373,150 @@ export function ClientDetailPage() {
           <p className="text-lg font-semibold">{formatBDT(netEquity)}</p>
         </div>
       </div>
+
+      {/* Commission Rate Card — admin only */}
+      {role === 'admin' && client && (
+        <div className="bg-card rounded-lg border border-border p-4 mb-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <span className="text-sm text-muted-foreground">Commission Rate: </span>
+              <span className="text-lg font-semibold">
+                {client.commission_rate != null ? `${(client.commission_rate * 100).toFixed(2)}%` : 'Not set'}
+              </span>
+            </div>
+            {!showRateForm && (
+              <button
+                onClick={() => {
+                  setNewRate(client.commission_rate != null ? (client.commission_rate * 100).toFixed(2) : '');
+                  setEffectiveDate(new Date().toISOString().slice(0, 10));
+                  setRateReason('');
+                  setRateError(null);
+                  setShowRateForm(true);
+                }}
+                className="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded hover:opacity-90"
+              >
+                Change Rate
+              </button>
+            )}
+          </div>
+
+          {showRateForm && (
+            <div className="mt-3 border-t border-border pt-3 space-y-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">New Rate (%)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={newRate}
+                    onChange={e => setNewRate(e.target.value)}
+                    className="w-full px-3 py-1.5 text-sm border border-border rounded bg-background"
+                    placeholder="0.40"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">Effective Date</label>
+                  <input
+                    type="date"
+                    value={effectiveDate}
+                    onChange={e => setEffectiveDate(e.target.value)}
+                    className="w-full px-3 py-1.5 text-sm border border-border rounded bg-background"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">Reason</label>
+                  <input
+                    type="text"
+                    value={rateReason}
+                    onChange={e => setRateReason(e.target.value)}
+                    className="w-full px-3 py-1.5 text-sm border border-border rounded bg-background"
+                    placeholder="e.g., Investor requested rate change"
+                  />
+                </div>
+              </div>
+              {rateError && <p className="text-sm text-destructive">{rateError}</p>}
+              <div className="flex gap-2 justify-end">
+                <button
+                  onClick={() => setShowRateForm(false)}
+                  className="px-3 py-1.5 text-sm border border-border rounded hover:bg-muted"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={savingRate || !newRate}
+                  onClick={async () => {
+                    setRateError(null);
+                    try {
+                      const rateDecimal = parseFloat(newRate) / 100;
+                      if (isNaN(rateDecimal) || rateDecimal < 0 || rateDecimal > 0.01) {
+                        setRateError('Rate must be between 0% and 1%');
+                        return;
+                      }
+                      await changeRate({
+                        p_client_id: clientId!,
+                        p_new_rate: rateDecimal,
+                        p_effective_date: effectiveDate,
+                        p_reason: rateReason || undefined,
+                      });
+                      // Refresh client data
+                      const { data } = await supabase.from('clients').select('*').eq('client_id', clientId).single();
+                      if (data) setClient(data as Client);
+                      await refreshHistory();
+                      setShowRateForm(false);
+                    } catch (err) {
+                      setRateError(err instanceof Error ? err.message : String(err));
+                    }
+                  }}
+                  className="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded hover:opacity-90 disabled:opacity-50"
+                >
+                  {savingRate ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Change History */}
+          {commissionHistory.length > 0 && (
+            <div className="mt-3 border-t border-border pt-3">
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+              >
+                {showHistory ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                Change History ({commissionHistory.length})
+              </button>
+              {showHistory && (
+                <div className="mt-2 overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-left text-muted-foreground">
+                        <th className="py-1 pr-3">Date</th>
+                        <th className="py-1 pr-3">Old → New</th>
+                        <th className="py-1 pr-3">By</th>
+                        <th className="py-1 pr-3">Effective</th>
+                        <th className="py-1">Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {commissionHistory.map(c => (
+                        <tr key={c.id} className="border-b border-border/50">
+                          <td className="py-1 pr-3 whitespace-nowrap">{new Date(c.created_at).toLocaleDateString()}</td>
+                          <td className="py-1 pr-3 whitespace-nowrap">
+                            {c.old_rate != null ? `${(c.old_rate * 100).toFixed(2)}%` : '—'} → {(c.new_rate * 100).toFixed(2)}%
+                          </td>
+                          <td className="py-1 pr-3 whitespace-nowrap">{c.changed_by_email ?? '—'}</td>
+                          <td className="py-1 pr-3 whitespace-nowrap">{c.effective_date}</td>
+                          <td className="py-1 text-muted-foreground">{c.reason ?? '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-border">
@@ -416,12 +644,18 @@ export function ClientDetailPage() {
                     summaryRows.map(r => (
                       <tr key={r.exec_id} className="border-b border-border">
                         <td className="p-2">{fmtDate(r.trade_date)}</td>
-                        <td className="p-2">{r.side === 'BUY' ? 'BUY' : 'SELL'}</td>
-                        <td className="p-2">{r.side === 'BUY' ? 'Bought' : 'Sold'} {getSecCode(r.isin)}</td>
-                        <td className="p-2 text-right">{formatNumber(r.quantity, 0)}</td>
-                        <td className="p-2 text-right">{formatNumber(r.price, 4)}</td>
-                        <td className="p-2 text-right">{formatNumber(r.debit)}</td>
-                        <td className="p-2 text-right">{formatNumber(r.credit)}</td>
+                        <td className="p-2">
+                          {r.side === 'BUY' ? 'BUY' : r.side === 'SELL' ? 'SELL' : r.side === 'RECEIPT' ? 'Receipt' : 'Payment'}
+                        </td>
+                        <td className="p-2">
+                          {r.side === 'BUY' ? `Bought ${getSecCode(r.isin)}` :
+                           r.side === 'SELL' ? `Sold ${getSecCode(r.isin)}` :
+                           r.side === 'RECEIPT' ? 'Cash' : 'Cash'}
+                        </td>
+                        <td className="p-2 text-right">{r.quantity > 0 ? formatNumber(r.quantity, 0) : ''}</td>
+                        <td className="p-2 text-right">{r.price > 0 ? formatNumber(r.price, 4) : ''}</td>
+                        <td className="p-2 text-right">{r.debit > 0 ? formatNumber(r.debit) : ''}</td>
+                        <td className="p-2 text-right">{r.credit > 0 ? formatNumber(r.credit) : ''}</td>
                         <td className="p-2 text-right">{formatNumber(r.balance)}</td>
                       </tr>
                     ))

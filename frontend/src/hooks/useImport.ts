@@ -181,6 +181,11 @@ export function useImport() {
     const type = fileType || detectFileType(file);
     const dateStr = asOfDate || new Date().toISOString().slice(0, 10);
 
+    // Guard against double-submission (e.g. double-click)
+    if (progress.stage !== 'idle' && progress.stage !== 'done' && progress.stage !== 'error' && progress.stage !== 'reconciliation') {
+      return;
+    }
+
     setProgress({
       stage: 'parsing',
       totalRows: 0,

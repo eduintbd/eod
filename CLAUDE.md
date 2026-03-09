@@ -568,3 +568,76 @@ Updated amount_payable column for all clients.
 | **Recalculate holdings for 1,314 clients** | MEDIUM | Fee changes on Jan 13 BUY trades changed `net_value`, which affects `average_cost` in holdings |
 | **Fix deposit import deduplication** | MEDIUM | Client 15595 had duplicate deposit; check other clients for similar issues |
 | **Load Jan 14 daily prices** | HIGH | Need daily_prices for Jan 14 to compute portfolio valuations |
+
+---
+
+## Session Summary — 2026-03-10: Commission Rate Change Feature & Summary Tab Fixes
+
+### Features Implemented
+
+#### 1. Manual Commission Rate Change with Audit Trail
+Full implementation across 5 files:
+
+**Database migration (`supabase/migrations/00011_commission_rate_changes.sql`):**
+- `commission_rate_changes` audit table with RLS policies (admin: full, others: read-only)
+- `change_commission_rate()` SECURITY DEFINER RPC — atomically updates `clients.commission_rate` and inserts audit row with old/new rates, user email, reason
+
+**Frontend type (`frontend/src/lib/types.ts`):**
+- Added `CommissionRateChange` interface
+
+**React hook (`frontend/src/hooks/useCommissionRate.ts`):**
+- `useCommissionRateHistory(clientId)` — fetches audit history ordered by `created_at DESC`
+- `useChangeCommissionRate()` — calls RPC, returns `{ changeRate, saving, error }`
+
+**Auth hook (`frontend/src/hooks/useAuth.ts`):**
+- Added `role` state fetched from `app_users` table
+- Returns `{ user, session, role, loading, signIn, signOut }` for admin-only UI gating
+
+**Client detail page (`frontend/src/pages/ClientDetailPage.tsx`):**
+- Admin-only commission rate card with current rate display and "Change Rate" button
+- Inline form: new rate (%), effective date, reason
+- Collapsible change history table (Date, Old → New, By, Effective, Reason)
+
+#### 2. Summary Tab: Deposits/Withdrawals in Investor Ledger
+- Added deposit/withdrawal entries from `cash_ledger` to the Summary tab's ledger statement
+- Merged trades + deposits/withdrawals into unified sorted list
+- Deposits appear as "Receipt/Cash" rows, withdrawals as "Payment/Cash" rows
+- Closing balance now correctly reflects deposits/withdrawals
+
+#### 3. Import Double-Submission Guard
+- Added guard in `useImport.ts` to prevent double-click triggering duplicate imports
+
+### Bugs Fixed
+
+#### Summary Tab NaN/Undefined Ghost Rows (FE_Summary_issue2)
+**Root cause:** Promise.all array ordering mismatch in `loadSummary()`. The deposit/withdrawal query was at index 4 and securities query at index 5, but destructuring had `secRes` at index 4 and `depWithdrawRes` at index 5. This caused securities data (`{isin, security_code}` objects) to be cast as `CashLedgerEntry[]`, producing ghost "Payment" rows with undefined fields.
+
+**Fix:** Swapped destructuring order from `[..., secRes, depWithdrawRes]` to `[..., depWithdrawRes, secRes]` to match the Promise.all array order.
+
+#### Other Summary Tab Fixes
+- `localeCompare` on undefined `trade_date` — added null coalescing `(a.trade_date ?? '')`
+- React duplicate key warning (`dep-undefined`) — fixed with `d.id ?? idx`
+- NaN amounts from Supabase NUMERIC strings — added `Number()` conversion
+- Empty date range queries — conditional query with `Promise.resolve()` fallback
+
+#### Bulk Duplicate Deposits
+- Identified Jan 14 deposit file imported twice (audit ids 54/55), deleted 307 duplicate entries
+- Recalculated running balances for affected clients
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `supabase/migrations/00011_commission_rate_changes.sql` | New: audit table + RPC |
+| `frontend/src/lib/types.ts` | Added `CommissionRateChange` interface |
+| `frontend/src/hooks/useCommissionRate.ts` | New: rate history + change rate hooks |
+| `frontend/src/hooks/useAuth.ts` | Added `role` from `app_users` |
+| `frontend/src/hooks/useImport.ts` | Added double-submission guard |
+| `frontend/src/pages/ClientDetailPage.tsx` | Commission rate card, summary deposits/withdrawals, Promise.all fix |
+
+### Pending Tasks
+| Task | Priority | Details |
+|------|----------|---------|
+| **Add `commission_all_inclusive` flag to clients** | HIGH | Distinguish all-inclusive vs discounted commission rates |
+| **Investigate OBO5196 opening balance** | MEDIUM | Admin balance -201,582 vs back-office ~-234,865 |
+| **Recalculate holdings for 1,314 clients** | MEDIUM | Fee changes on Jan 13 BUY trades affect `average_cost` |
+| **Load Jan 14 daily prices** | HIGH | Need daily_prices for Jan 14 portfolio valuations |

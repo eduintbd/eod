@@ -360,6 +360,18 @@ export interface EodRun {
   created_at: string;
 }
 
+export interface CommissionRateChange {
+  id: number;
+  client_id: string;
+  old_rate: number | null;
+  new_rate: number;
+  effective_date: string;
+  reason: string | null;
+  changed_by: string | null;
+  changed_by_email: string | null;
+  created_at: string;
+}
+
 export interface EodPreflight {
   total_clients: number;
   trades_for_date: number;
